@@ -8,7 +8,7 @@ use zai_rs::{
 pub(crate) const DEFAULT_BASE_URL: &str = ApiFamily::PaasV4.default_base();
 pub(crate) const DEFAULT_CODING_PLAN_URL: &str = ApiFamily::CodingPaasV4.default_base();
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AiEndpoint {
     #[default]
     Standard,

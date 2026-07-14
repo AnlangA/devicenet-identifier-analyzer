@@ -1,5 +1,7 @@
 use crate::ai_import::AiEndpoint;
-use crate::app::{AnalyzerApp, DirectionFilter, FrameScope, InputTab, MessageFilters};
+use crate::app::{
+    AI_CONFIG_KEY, AiConfig, AnalyzerApp, DirectionFilter, FrameScope, InputTab, MessageFilters,
+};
 use crate::frame_input::FrameOrigin;
 use crate::theme::{
     ACCENT, AMBER, BG, BLUE, BORDER, MUTED, PANEL, PANEL_SOFT, PURPLE, RED, SURFACE, TEXT,
@@ -65,6 +67,18 @@ impl eframe::App for AnalyzerApp {
             .show(ui, |ui| selected_message_panel(ui, self));
 
         message_input_window(ui.ctx(), self);
+    }
+
+    /// 通过 eframe 的持久化接口将 AI 配置写入本地存储。
+    ///
+    /// `App::save` 会在退出以及 `auto_save_interval` 的周期内被调用。
+    /// 为了避免 `api_key` 明文落盘，这里先把配置序列化为 JSON，再用
+    /// `crate::secret` 加密为 Base64 字符串，最后以字符串形式写入 `Storage`。
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        let config = AiConfig::from_form(&self.ai_input);
+        if let Some(encoded) = config.encrypt() {
+            storage.set_string(AI_CONFIG_KEY, encoded);
+        }
     }
 }
 
@@ -699,7 +713,7 @@ fn io_assembly_controls(ui: &mut egui::Ui, selection: &mut IoAssemblySelection) 
                 );
                 ui.label(
                     RichText::new(format!(
-                        "Vol1 6-29 / 6-39 + GT EDS/device-dictionary mappings · Host MAC {} · Output host → device · Input device → host",
+                        "Vol1 6-29 / 6-39 + supplied device-table/R02 mappings · Host MAC {} · Output host → device · Input device → host",
                         selection.host_mac_id
                     ))
                     .size(11.0)

@@ -6,6 +6,7 @@ use devicenet_identifier_analyzer::{
     decode_trace_ordered_with_io, parse_trace_log,
 };
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -209,6 +210,53 @@ pub(crate) struct AiInputForm {
     pub(crate) message: Option<Result<String, String>>,
 }
 
+/// `eframe` 持久化使用的 `Storage` 键。整个应用仅保存一份 AI 配置。
+pub(crate) const AI_CONFIG_KEY: &str = "ai-config";
+
+/// 需要在本地持久化的 AI 相关配置。
+///
+/// 仅包含用户一次配置后应跨会话保留的字段（`api_key`、`endpoint`、
+/// `custom_base_url`）；`user_input` / `last_json` / `message` 等属于会话级状态，
+/// 不需要持久化，因此不在此结构中。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct AiConfig {
+    pub(crate) api_key: String,
+    pub(crate) endpoint: AiEndpoint,
+    pub(crate) custom_base_url: String,
+}
+
+impl AiConfig {
+    /// 从当前表单状态中提取需要持久化的配置。
+    pub(crate) fn from_form(form: &AiInputForm) -> Self {
+        Self {
+            api_key: form.api_key.clone(),
+            endpoint: form.endpoint,
+            custom_base_url: form.custom_base_url.clone(),
+        }
+    }
+
+    /// 将持久化的配置回填到表单字段。
+    pub(crate) fn apply_to(self, form: &mut AiInputForm) {
+        form.api_key = self.api_key;
+        form.endpoint = self.endpoint;
+        form.custom_base_url = self.custom_base_url;
+    }
+
+    /// 序列化为 JSON 后加密，返回 Base64 密文字符串。失败返回 `None`。
+    /// 该字符串随后通过 eframe 的 `Storage` 落盘。
+    pub(crate) fn encrypt(&self) -> Option<String> {
+        let json = serde_json::to_string(self).ok()?;
+        crate::secret::encrypt(&json)
+    }
+
+    /// 解密 Base64 密文字符串并反序列化为 `AiConfig`。
+    /// 任何环节失败都返回 `None`（调用方按“无保存配置”处理）。
+    pub(crate) fn decrypt(encoded: &str) -> Option<Self> {
+        let json = crate::secret::decrypt(encoded)?;
+        serde_json::from_str(&json).ok()
+    }
+}
+
 struct AiJob {
     receiver: Receiver<Result<AiImportOutput, String>>,
 }
@@ -287,6 +335,18 @@ impl AnalyzerApp {
             ai_input: AiInputForm::default(),
             ai_job: None,
         };
+
+        // 恢复上次保存的 AI 配置。
+        // 存储中的内容是“加密后的 Base64 字符串”，因此用 `get_string` 取出后
+        // 再调用 `AiConfig::decrypt` 解密；任何失败（无存储/格式错误/密钥不匹配）
+        // 都视为「无保存配置」，直接使用默认值。
+        if let Some(storage) = cc.storage.as_ref() {
+            if let Some(encoded) = storage.get_string(AI_CONFIG_KEY) {
+                if let Some(config) = AiConfig::decrypt(&encoded) {
+                    config.apply_to(&mut app.ai_input);
+                }
+            }
+        }
 
         if let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) {
             app.load_file(path);

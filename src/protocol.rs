@@ -3,6 +3,7 @@
 use crate::assembly::{IoAssemblyDirection, assembly_instance, decode_assembly};
 use crate::explicit::{ExplicitHeader, FragmentKind, MessageBodyFormat, fragment_ack_status};
 use crate::group2::{Group2Analysis, Group2Decoder, Group2Function};
+use crate::mfc_explicit::{AttributeDecode, DeviceKey, MfcExplicitState, PendingAttributeUpdate};
 use crate::path::decode_logical_path;
 use crate::services::{
     ServiceDetails, decode_common_service_data, format_u16, hex_bytes, service_name,
@@ -319,6 +320,7 @@ struct ExplicitRequestContext {
     class_id: Option<u32>,
     instance_id: Option<u32>,
     attribute_id: Option<u32>,
+    pending_attribute_update: Option<PendingAttributeUpdate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -357,6 +359,7 @@ struct IoFragmentState {
 #[derive(Default)]
 struct ProtocolDecoder {
     group2: Group2Decoder,
+    mfc_explicit: MfcExplicitState,
     connections: HashMap<ConnectionKey, ConnectedContext>,
     pending_opens: HashMap<UcmmKey, PendingOpen>,
     pending_closes: HashMap<UcmmKey, (u16, u64)>,
@@ -392,7 +395,10 @@ impl ProtocolDecoder {
                 source_mac_id,
                 message,
             )),
-            IdentifierFields::Group2 { .. } => self.group2.decode(message).map(Into::into),
+            IdentifierFields::Group2 { .. } => self
+                .group2
+                .decode(message, &mut self.mfc_explicit)
+                .map(Into::into),
             IdentifierFields::Group3 {
                 message_id,
                 source_mac_id,
@@ -513,7 +519,7 @@ impl ProtocolDecoder {
         };
         let Some(instance) = assembly_instance(direction, instance_number) else {
             analysis.warnings.push(format!(
-                "Instance {instance_number} is not a supported Volume 1 6-29/6-39 or GT-1000-D EDS {} Assembly",
+                "Instance {instance_number} is not a supported Volume 1 6-29/6-39 or user-provided device-table {} Assembly",
                 direction.label()
             ));
             return analysis;
@@ -1198,11 +1204,6 @@ impl ProtocolDecoder {
         };
         let bytes = message.data.get(2..).unwrap_or_default();
         match (kind, count) {
-            (FragmentKind::First, 0x3f) => {
-                self.fragments.remove(&key);
-                analysis.push("Reassembly", "Single-fragment complete message");
-                self.decode_connected_body(message, context, xid, bytes, analysis)
-            }
             (FragmentKind::First, 0) => {
                 self.fragments.insert(
                     key,
@@ -1260,7 +1261,7 @@ impl ProtocolDecoder {
                 self.fragments.remove(&key);
                 analysis
                     .warnings
-                    .push("Invalid first fragment count or reserved fragment type".into());
+                    .push("Explicit first fragment count must be 0; reassembly was reset".into());
                 analysis
             }
             (FragmentKind::Acknowledge, _) => unreachable!("acknowledgments returned above"),
@@ -1351,6 +1352,31 @@ impl ProtocolDecoder {
                         request.service
                     ));
                 }
+                if state_valid && response_matches_request {
+                    if service == 0x0e {
+                        if let (Some(class_id), Some(instance_id), Some(attribute_id)) =
+                            (request.class_id, request.instance_id, request.attribute_id)
+                        {
+                            append_attribute_decode(
+                                &mut analysis,
+                                self.mfc_explicit.decode_get_response(
+                                    DeviceKey {
+                                        bus: message.bus,
+                                        mac_id: context.server_mac,
+                                    },
+                                    class_id,
+                                    instance_id,
+                                    attribute_id,
+                                    &body[1..],
+                                ),
+                            );
+                        }
+                    } else if service == 0x10 {
+                        if let Some(pending) = request.pending_attribute_update {
+                            self.mfc_explicit.commit(pending);
+                        }
+                    }
+                }
             } else if service != 0x14 {
                 analysis
                     .warnings
@@ -1361,8 +1387,11 @@ impl ProtocolDecoder {
 
         let address = parse_request_address(body, context.format, &mut analysis);
         let mut service_data = body.get(address.offset..).unwrap_or_default();
-        let mut attribute_id = None;
-        if matches!(service, 0x0e | 0x10) && context.format != MessageBodyFormat::CipPath {
+        let mut attribute_id = address.attribute_id;
+        if matches!(service, 0x0e | 0x10)
+            && context.format != MessageBodyFormat::CipPath
+            && attribute_id.is_none()
+        {
             if let Some(attribute) = service_data.first().copied() {
                 attribute_id = Some(u32::from(attribute));
                 analysis.push("Attribute ID", format_value(u32::from(attribute)));
@@ -1379,7 +1408,46 @@ impl ProtocolDecoder {
             service_data,
             context.format != MessageBodyFormat::CipPath,
         ));
-        if state_valid {
+        if service == 0x0e
+            && let (Some(class_id), Some(instance_id), Some(attribute_id)) =
+                (address.class_id, address.instance_id, attribute_id)
+        {
+            append_attribute_decode(
+                &mut analysis,
+                self.mfc_explicit
+                    .describe_get_request(class_id, instance_id, attribute_id),
+            );
+        }
+        let mut pending_attribute_update = if service == 0x10 {
+            match (address.class_id, address.instance_id, attribute_id) {
+                (Some(class_id), Some(instance_id), Some(attribute_id)) => append_attribute_decode(
+                    &mut analysis,
+                    self.mfc_explicit.decode_set_request(
+                        DeviceKey {
+                            bus: message.bus,
+                            mac_id: context.server_mac,
+                        },
+                        class_id,
+                        instance_id,
+                        attribute_id,
+                        service_data,
+                    ),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let existing_request_frame = state_valid
+            .then(|| self.requests.get(&request_key).map(|request| request.frame))
+            .flatten();
+        if let Some(existing_frame) = existing_request_frame {
+            pending_attribute_update = None;
+            analysis.warnings.push(format!(
+                "Request frame #{existing_frame} is still pending for this connected Explicit connection/XID; the new request was not stored and any pending Set update from it was discarded"
+            ));
+        }
+        if state_valid && existing_request_frame.is_none() {
             self.requests.insert(
                 request_key,
                 ExplicitRequestContext {
@@ -1388,6 +1456,7 @@ impl ProtocolDecoder {
                     class_id: address.class_id,
                     instance_id: address.instance_id,
                     attribute_id,
+                    pending_attribute_update,
                 },
             );
         }
@@ -1444,6 +1513,7 @@ fn io_payload_direction(
 struct ParsedAddress {
     class_id: Option<u32>,
     instance_id: Option<u32>,
+    attribute_id: Option<u32>,
     offset: usize,
 }
 
@@ -1491,6 +1561,7 @@ fn parse_request_address(
             let logical_path = decode_logical_path(path);
             address.class_id = logical_path.class_id;
             address.instance_id = logical_path.instance_id;
+            address.attribute_id = logical_path.attribute_id;
             if let Some(display) = logical_path.display {
                 analysis.push("Logical path", display);
             }
@@ -1499,6 +1570,9 @@ fn parse_request_address(
             }
             if let Some(value) = address.instance_id {
                 analysis.push("Instance ID", format_value(value));
+            }
+            if let Some(value) = address.attribute_id {
+                analysis.push("Attribute ID", format_value(value));
             }
             address.offset = 2 + used;
             if used != expected {
@@ -1990,6 +2064,20 @@ fn raw_tail(analysis: &mut FrameAnalysis, name: &str, data: &[u8]) {
     }
 }
 
+fn append_attribute_decode(
+    analysis: &mut FrameAnalysis,
+    decoded: AttributeDecode,
+) -> Option<PendingAttributeUpdate> {
+    let AttributeDecode {
+        fields,
+        warnings,
+        pending_update,
+    } = decoded;
+    analysis.fields.extend(fields);
+    analysis.warnings.extend(warnings);
+    pending_update
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2112,7 +2200,7 @@ mod tests {
         let messages = vec![
             message(1, 0x780, &[5, 0x4b, 2, 0x10]),
             message(2, 0x745, &[0, 0xcb, 2, 0x45, 2, 0]),
-            message(3, 0x42c, &[0, 0x0e, 1, 1, 1]),
+            message(3, 0x42c, &[0, 0x0e, 1, 0, 1, 0, 1]),
             message(4, 0x42d, &[0, 0x8e, 0xaa]),
             message(5, 0x780, &[5, 0x4c, 2, 0]),
             message(6, 0x745, &[0, 0xcc]),
@@ -2132,6 +2220,61 @@ mod tests {
             FrameFunction::Group2(Group2Function::ExplicitOrUnconnectedResponse)
         );
         assert_eq!(decoded[6].as_ref().unwrap().field("Request frame"), None);
+    }
+
+    #[test]
+    fn decodes_profile_attributes_on_learned_connected_explicit_ids() {
+        let messages = vec![
+            message(1, 0x780, &[5, 0x4b, 2, 0x10]),
+            message(2, 0x745, &[0, 0xcb, 2, 0x45, 2, 0]),
+            message(3, 0x42c, &[0, 0x0e, 1, 0, 1, 0, 1]),
+            message(4, 0x42d, &[0, 0x8e, 0x15, 0x07]),
+        ];
+        let decoded = decode_trace_ordered(&messages);
+        let response = decoded[3].as_ref().unwrap();
+
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Read target"),
+            Some("Identity instance 1 / Vendor ID")
+        );
+        assert_eq!(response.field("Attribute data"), Some("15 07"));
+        assert_eq!(
+            response.field("Read target"),
+            Some("Identity instance 1 / Vendor ID")
+        );
+        assert!(
+            response
+                .field("Vendor ID")
+                .is_some_and(|value| value.contains("BLUE DYNAMICS"))
+        );
+    }
+
+    #[test]
+    fn keeps_first_pending_request_when_connected_xid_is_reused() {
+        let messages = vec![
+            message(1, 0x780, &[5, 0x4b, 2, 0x10]),
+            message(2, 0x745, &[0, 0xcb, 2, 0x45, 2, 0]),
+            message(3, 0x42c, &[0, 0x0e, 0x31, 0, 1, 0, 3]),
+            message(4, 0x42d, &[0, 0x8e, 0xc3]),
+            message(5, 0x42c, &[0, 0x10, 0x31, 0, 1, 0, 3, 0xca]),
+            message(6, 0x42c, &[0, 0x10, 0x31, 0, 1, 0, 3, 0xc3]),
+            message(7, 0x42d, &[0, 0x90]),
+            message(8, 0x42c, &[0, 0x0e, 0x31, 0, 1, 0, 6]),
+            message(9, 0x42d, &[0, 0x8e, 0x00, 0x00, 0x48, 0x41]),
+        ];
+        let decoded = decode_trace_ordered(&messages);
+
+        let collision = decoded[5].as_ref().unwrap();
+        assert!(collision.warnings.iter().any(|warning| {
+            warning.contains("frame #5")
+                && warning.contains("still pending")
+                && warning.contains("not stored")
+        }));
+        assert_eq!(
+            decoded[6].as_ref().unwrap().field("Request frame"),
+            Some("#5")
+        );
+        assert_eq!(decoded[8].as_ref().unwrap().field("Flow"), Some("12.5"));
     }
 
     #[test]
@@ -2367,6 +2510,25 @@ mod tests {
         assert_eq!(
             decoded[4].as_ref().unwrap().field("Request frame"),
             Some("#3")
+        );
+    }
+
+    #[test]
+    fn rejects_io_single_fragment_marker_on_connected_explicit_connection() {
+        let messages = vec![
+            message(1, 0x780, &[5, 0x4b, 2, 0x10]),
+            message(2, 0x745, &[0, 0xcb, 2, 0x45, 2, 0]),
+            message(3, 0x42d, &[0x80, 0x3f, 0x8e, 0xaa]),
+        ];
+
+        let decoded = decode_trace_ordered(&messages);
+        let analysis = decoded[2].as_ref().unwrap();
+        assert_eq!(analysis.field("Service"), None);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("first fragment count must be 0"))
         );
     }
 

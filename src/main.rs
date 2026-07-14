@@ -1,6 +1,7 @@
 mod ai_import;
 mod app;
 mod frame_input;
+mod secret;
 mod theme;
 mod ui;
 

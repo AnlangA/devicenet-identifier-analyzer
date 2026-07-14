@@ -22,6 +22,16 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 - Group 2 Only Allocate/Release request and response decoding
 - Stateful Message Body Format 0-4 tracking and object address decoding
 - Generic connected Explicit Request/Response service decoding and correlation
+- Stateful MFC/EMFC Explicit `Get_Attribute_Single` and `Set_Attribute_Single`
+  interpretation for the industry profile objects and attributes used by the supported devices
+- Identity and S-Device Supervisor details, including CIP vendor identity and the
+  manufacturer/model/revision/serial strings exposed by the device
+- Typed values for the DeviceNet Object (`0x03`, instance 1) and Connection Object
+  (`0x05`, Explicit instance 1 and Polled I/O instance 2) attributes listed by the
+  user-provided device table
+- Dynamic `INT`/`REAL` values, engineering-unit attributes, and the supplied device-table
+  Sensor attribute `0x6E` configured-full-scale value are interpreted only when the
+  required type, unit, and scaling context has been observed
 - DeviceNet error, Duplicate MAC ID, Heartbeat, and Shutdown decoding
 - Acknowledged Explicit Message fragmentation, acknowledgment, and reassembly
 - Group 3 UCMM Open/Close/Error, Heartbeat, and Shutdown decoding
@@ -30,8 +40,10 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
   contaminating the predefined Group 2 state machine
 - Selectable Input and Output I/O Assembly decoding for the Volume 1 Section 6-29 Mass Flow
   Controller and Section 6-39 Enhanced Mass Flow Controller profiles
-- GT-1000-D EDS vendor Assemblies `0x97` (Flow/Valve/Temperature) and `0x98`
-  (Override/Valve), with device-specific Counts full-scale context
+- User-provided device-table Input Assembly 150 (`0x96`,
+  Flow/Valve/Temperature/Pressure), Input Assembly 151 (`0x97`, Flow/Valve/Temperature),
+  and Output Assembly 152 (`0x98`, Override/Valve), with the documented Counts full-scale
+  context; Assembly 150 follows the supplied R02 map
 - Assembly component values include their CIP type, device-configured engineering-unit
   context, and mapped object/attribute description
 - Unacknowledged DeviceNet I/O fragment reassembly for selected Assembly instances larger
@@ -50,9 +62,13 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 
 The message decoder is checked against DeviceNet Volume 3 Edition 1.16 and the CIP common
 service definitions in Volume 1 Edition 3.37. In particular, Volume 3 Section 3-7 identifier
-roles and mappings have dedicated regression tests. I/O payloads and object/class-specific
-service tails remain raw when their layouts are not selected from the supported Volume 1
-profiles or defined by the common service specification.
+roles and mappings have dedicated regression tests. Explicit decoding follows Volume 3
+Sections 2-7.3.1 and 2-7.3.2 for Message Body Formats 0-4, Section 2-7.3.3 for successful
+responses, Section 2-7.3.4 for error responses, and Section 2-9 for acknowledged Explicit
+fragmentation and reassembly. Because a successful response does not repeat its object path,
+typed response interpretation is performed only after correlation with the matching request.
+I/O payloads and object/class-specific service tails remain raw when their layouts are not
+selected from the supported Volume 1 profiles or defined by the common service specification.
 
 ## Run
 
@@ -98,12 +114,42 @@ direction. Status/exception-only instances are neutral.
 
 DeviceNet EDS `[IO_Info]` entries describe a connection's total size, compatibility mask,
 display name, and Assembly path; they do not define member boundaries, numeric types, units, or
-scaling. Vendor-specific Assembly names therefore remain insufficient evidence for a typed
-conversion unless a separate manufacturer schema defines their members.
+scaling. An Assembly display name alone therefore remains insufficient evidence for a typed
+conversion unless a separate device table defines its members.
 
 All selectable mappings in this analyzer are fixed-size static Assemblies. Their table/EDS total
 size is therefore the selected Produced/Consumed Connection Size used to decide whether the
 DeviceNet unacknowledged I/O fragmentation protocol is present.
+
+Explicit numeric interpretation is intentionally limited to data used by the Volume 1 Section
+6-29 MFC and Section 6-39 EMFC profiles and fields documented by the user-provided device
+table/R02 mapping. For the supported Identity, DeviceNet Object, Connection Object, S-Device
+Supervisor, S-Analog Sensor, S-Analog Actuator, S-Single Stage Controller, and S-Gas
+Calibration attributes, a `Get_Attribute_Single` response is decoded using its correlated
+request target. Get requests/responses show a `Read target`; Set requests show a `Write target`
+and the parsed value. A `Set_Attribute_Single` request value is displayed immediately, but its new
+type/unit/full-scale context is accepted only after the correlated response succeeds. DeviceNet
+Object (`0x03`) interpretation covers the documented instance-1 MAC ID, baud-rate, bus-off,
+allocation, and hardware-switch values. Connection Object (`0x05`) interpretation covers the
+documented Explicit and Polled I/O instances' state, connection IDs and sizes, timing values,
+watchdog action, and path lengths/data; unsupported attributes still use the raw-value fallback.
+
+Dynamic values use the object's observed Data Type (`INT` or `REAL`) and a per-instance Data
+Units whitelist. If Data Type has not appeared in the trace, an exact two-byte payload is shown
+as `INT` and an exact four-byte payload as `REAL` for that field only; the inference is not stored
+as device state. Incompatible units, non-finite values, and stale type/unit-dependent scales are
+reported and excluded from engineering conversions. When the
+supplied device table defines Sensor configured-full-scale attribute `0x6E` (`REAL` amount plus
+`UINT` engineering unit) and the required numeric full-scale context is available, Counts can
+be converted to the configured engineering value; supported direct physical-unit and
+percent-of-full-scale values retain their applicable unit and description. Connection paths are
+shown as both raw Packed EPATH bytes and logical targets, and Gas Calibration `DATE` values show
+the calendar date plus the encoded day count. Identity results include the standard CIP Vendor
+ID and related product identity fields, while Supervisor results expose the manufacturer strings
+actually returned by the device. If a request is missing, a response is unsuccessful, a type or
+unit is unknown, required scaling context is absent, or an attribute is outside this deliberately
+small profile/device-table subset, the analyzer keeps the original attribute/service bytes and
+does not guess a conversion.
 
 ## Architecture
 
@@ -116,6 +162,8 @@ DeviceNet unacknowledged I/O fragmentation protocol is present.
 - `src/group2.rs`: stateful predefined Group 2 Only protocol decoder
 - `src/protocol.rs`: unified Group 1-4, UCMM, dynamic connection, and Offline Connection Set decoder
 - `src/services.rs`: CIP common Service Code metadata and service-data decoder
+- `src/mfc_explicit.rs`: profile-scoped MFC/EMFC Explicit attribute metadata, state, and
+  numeric/unit interpretation
 - `src/app.rs`: document, selection, sort, filter, and derived-statistics state
 - `src/frame_input.rs`: manual frame validation, source tracking, and text export
 - `src/ai_import.rs`: optimized extraction prompt and Z.ai Function Calling client

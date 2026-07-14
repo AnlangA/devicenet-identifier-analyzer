@@ -4,6 +4,7 @@
 pub(crate) struct LogicalPath {
     pub(crate) class_id: Option<u32>,
     pub(crate) instance_id: Option<u32>,
+    pub(crate) attribute_id: Option<u32>,
     pub(crate) display: Option<String>,
 }
 
@@ -49,6 +50,7 @@ pub(crate) fn decode_logical_path(path: &[u8]) -> LogicalPath {
             match logical_type {
                 0 => decoded.class_id = Some(value),
                 1 => decoded.instance_id = Some(value),
+                4 => decoded.attribute_id = Some(value),
                 _ => {}
             }
         }
@@ -101,9 +103,25 @@ mod tests {
         let decoded = decode_logical_path(&[0x21, 0x34, 0x12, 0x25, 0x78, 0x56]);
         assert_eq!(decoded.class_id, Some(0x1234));
         assert_eq!(decoded.instance_id, Some(0x5678));
+        assert_eq!(decoded.attribute_id, None);
         assert_eq!(
             decoded.display.as_deref(),
             Some("Class=0x1234 (4660), Instance=0x5678 (22136)")
         );
+    }
+
+    #[test]
+    fn extracts_8_16_and_32_bit_attribute_logical_segments_from_packed_paths() {
+        let attribute_8 = decode_logical_path(&[0x20, 0x31, 0x24, 0x01, 0x30, 0x6e]);
+        assert_eq!(attribute_8.class_id, Some(0x31));
+        assert_eq!(attribute_8.instance_id, Some(1));
+        assert_eq!(attribute_8.attribute_id, Some(0x6e));
+
+        let attribute_16 = decode_logical_path(&[0x20, 0x31, 0x24, 0x01, 0x31, 0x34, 0x12]);
+        assert_eq!(attribute_16.attribute_id, Some(0x1234));
+
+        let attribute_32 =
+            decode_logical_path(&[0x20, 0x31, 0x24, 0x01, 0x32, 0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(attribute_32.attribute_id, Some(0x1234_5678));
     }
 }

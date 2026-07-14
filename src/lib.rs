@@ -7,6 +7,7 @@ mod analysis;
 mod assembly;
 mod explicit;
 mod group2;
+mod mfc_explicit;
 mod path;
 mod protocol;
 mod services;

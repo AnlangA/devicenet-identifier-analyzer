@@ -1,4 +1,5 @@
 use crate::explicit::{ExplicitHeader, FragmentKind, MessageBodyFormat, fragment_ack_status};
+use crate::mfc_explicit::{AttributeDecode, DeviceKey, MfcExplicitState, PendingAttributeUpdate};
 use crate::path::decode_logical_path;
 use crate::services::{decode_common_service_data, service_name};
 use crate::status::general_status_name;
@@ -102,6 +103,7 @@ struct RequestContext {
     class_id: Option<u32>,
     instance_id: Option<u32>,
     attribute_id: Option<u32>,
+    pending_attribute_update: Option<PendingAttributeUpdate>,
     kind: RequestKind,
 }
 
@@ -137,9 +139,10 @@ pub fn decode_group2_trace(messages: &[TraceMessage]) -> HashMap<u64, Group2Anal
     });
 
     let mut decoder = Group2Decoder::default();
+    let mut mfc_explicit = MfcExplicitState::default();
     let mut analyses = HashMap::new();
     for message in ordered {
-        if let Some(analysis) = decoder.decode(message) {
+        if let Some(analysis) = decoder.decode(message, &mut mfc_explicit) {
             analyses.insert(message.number, analysis);
         }
     }
@@ -160,15 +163,20 @@ pub fn decode_group2_trace_ordered(messages: &[TraceMessage]) -> Vec<Option<Grou
     });
 
     let mut decoder = Group2Decoder::default();
+    let mut mfc_explicit = MfcExplicitState::default();
     let mut analyses = vec![None; messages.len()];
     for (source_index, message) in ordered {
-        analyses[source_index] = decoder.decode(message);
+        analyses[source_index] = decoder.decode(message, &mut mfc_explicit);
     }
     analyses
 }
 
 impl Group2Decoder {
-    pub(crate) fn decode(&mut self, message: &TraceMessage) -> Option<Group2Analysis> {
+    pub(crate) fn decode(
+        &mut self,
+        message: &TraceMessage,
+        mfc_explicit: &mut MfcExplicitState,
+    ) -> Option<Group2Analysis> {
         if !(0x400..=0x5ff).contains(&message.identifier) {
             return None;
         }
@@ -179,7 +187,9 @@ impl Group2Decoder {
 
         match message_id {
             0 | 1 | 2 | 5 => Some(self.decode_io(message, function, mac_id, message_id)),
-            3 | 4 | 6 => Some(self.decode_explicit(message, function, mac_id, message_id)),
+            3 | 4 | 6 => {
+                Some(self.decode_explicit(message, function, mac_id, message_id, mfc_explicit))
+            }
             7 => Some(self.decode_duplicate_mac(message, function, mac_id)),
             _ => unreachable!(),
         }
@@ -267,6 +277,7 @@ impl Group2Decoder {
         function: Group2Function,
         mac_id: u8,
         message_id: u8,
+        mfc_explicit: &mut MfcExplicitState,
     ) -> Group2Analysis {
         let mut base = Group2Analysis::new(function, function.label());
         base.push("Message ID", format!("{message_id}"));
@@ -302,6 +313,7 @@ impl Group2Decoder {
                 header,
                 &message.data[1..],
                 base,
+                mfc_explicit,
             );
         }
 
@@ -334,19 +346,6 @@ impl Group2Decoder {
         let fragment_body = message.data.get(2..).unwrap_or_default();
 
         match (fragment_kind, fragment_count) {
-            (FragmentKind::First, 0x3f) => {
-                self.fragments.remove(&key);
-                base.push("Reassembly", "Single-fragment complete message");
-                self.decode_explicit_body(
-                    message,
-                    function,
-                    mac_id,
-                    message_id,
-                    header,
-                    fragment_body,
-                    base,
-                )
-            }
             (FragmentKind::First, 0) => {
                 self.fragments.insert(
                     key,
@@ -365,7 +364,7 @@ impl Group2Decoder {
             (FragmentKind::First, _) => {
                 self.fragments.remove(&key);
                 base.warnings
-                    .push("First fragment count must be 0 or 63; reassembly was reset".into());
+                    .push("Explicit first fragment count must be 0; reassembly was reset".into());
                 base
             }
             (FragmentKind::Middle | FragmentKind::Last, _) => {
@@ -410,6 +409,7 @@ impl Group2Decoder {
                     header,
                     &state.body,
                     base,
+                    mfc_explicit,
                 );
                 decoded.title.push_str(" (Reassembled)");
                 decoded
@@ -428,6 +428,7 @@ impl Group2Decoder {
         header: u8,
         body: &[u8],
         mut analysis: Group2Analysis,
+        mfc_explicit: &mut MfcExplicitState,
     ) -> Group2Analysis {
         let Some(service_field) = body.first().copied() else {
             analysis
@@ -464,6 +465,7 @@ impl Group2Decoder {
                 body,
                 analysis,
                 state_valid,
+                mfc_explicit,
             )
         } else {
             self.decode_request(
@@ -476,6 +478,7 @@ impl Group2Decoder {
                 body,
                 analysis,
                 state_valid,
+                mfc_explicit,
             )
         }
     }
@@ -492,6 +495,7 @@ impl Group2Decoder {
         body: &[u8],
         mut analysis: Group2Analysis,
         state_valid: bool,
+        mfc_explicit: &MfcExplicitState,
     ) -> Group2Analysis {
         if body[0] & 0x80 != 0 {
             analysis
@@ -515,9 +519,10 @@ impl Group2Decoder {
 
         let address = parse_request_address(body, body_format, &mut analysis);
         let mut service_data = body.get(address.data_offset..).unwrap_or_default();
-        let mut attribute_id = None;
+        let mut attribute_id = address.attribute_id;
 
         if matches!(service_code, 0x0e | 0x10)
+            && attribute_id.is_none()
             && body_format.is_some_and(|format| {
                 !matches!(
                     format,
@@ -582,6 +587,37 @@ impl Group2Decoder {
             _ => {}
         }
 
+        if service_code == 0x0e
+            && let (Some(class_id), Some(instance_id), Some(attribute_id)) =
+                (address.class_id, address.instance_id, attribute_id)
+        {
+            append_attribute_decode(
+                &mut analysis,
+                mfc_explicit.describe_get_request(class_id, instance_id, attribute_id),
+            );
+        }
+
+        let mut pending_attribute_update = if service_code == 0x10 {
+            match (address.class_id, address.instance_id, attribute_id) {
+                (Some(class_id), Some(instance_id), Some(attribute_id)) => append_attribute_decode(
+                    &mut analysis,
+                    mfc_explicit.decode_set_request(
+                        DeviceKey {
+                            bus: message.bus,
+                            mac_id: device_mac,
+                        },
+                        class_id,
+                        instance_id,
+                        attribute_id,
+                        service_data,
+                    ),
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         if message_id == 6 && !matches!(service_code, 0x4b | 0x4c) {
             analysis
                 .warnings
@@ -590,14 +626,28 @@ impl Group2Decoder {
 
         let xid = (header >> 6) & 1;
         let client_mac = header & 0x3f;
-        if state_valid {
+        let request_key = RequestKey {
+            bus: message.bus,
+            device_mac,
+            client_mac,
+            xid,
+        };
+        let existing_request_frame = state_valid
+            .then(|| {
+                self.requests
+                    .get(&request_key)
+                    .map(|request| request.message_number)
+            })
+            .flatten();
+        if let Some(existing_frame) = existing_request_frame {
+            pending_attribute_update = None;
+            analysis.warnings.push(format!(
+                "Request frame #{existing_frame} is still pending for this Group 2 device/client/XID; the new request was not stored and any pending Set update from it was discarded"
+            ));
+        }
+        if state_valid && existing_request_frame.is_none() {
             self.requests.insert(
-                RequestKey {
-                    bus: message.bus,
-                    device_mac,
-                    client_mac,
-                    xid,
-                },
+                request_key,
                 RequestContext {
                     message_number: message.number,
                     message_id,
@@ -612,6 +662,7 @@ impl Group2Decoder {
                     class_id: address.class_id,
                     instance_id: address.instance_id,
                     attribute_id,
+                    pending_attribute_update,
                     kind: request_kind,
                 },
             );
@@ -630,6 +681,7 @@ impl Group2Decoder {
         body: &[u8],
         mut analysis: Group2Analysis,
         state_valid: bool,
+        mfc_explicit: &mut MfcExplicitState,
     ) -> Group2Analysis {
         if body[0] & 0x80 == 0 {
             analysis
@@ -744,6 +796,33 @@ impl Group2Decoder {
                 decode_common_service_data(service_code, true, &body[1..], false),
             ),
         }
+        if state_valid && response_matches_request {
+            if let Some(request) = request.as_ref() {
+                if service_code == 0x0e {
+                    if let (Some(class_id), Some(instance_id), Some(attribute_id)) =
+                        (request.class_id, request.instance_id, request.attribute_id)
+                    {
+                        append_attribute_decode(
+                            &mut analysis,
+                            mfc_explicit.decode_get_response(
+                                DeviceKey {
+                                    bus: message.bus,
+                                    mac_id: device_mac,
+                                },
+                                class_id,
+                                instance_id,
+                                attribute_id,
+                                &body[1..],
+                            ),
+                        );
+                    }
+                } else if service_code == 0x10 {
+                    if let Some(pending) = request.pending_attribute_update.clone() {
+                        mfc_explicit.commit(pending);
+                    }
+                }
+            }
+        }
         attach_request_context(&mut analysis, request.as_ref());
         if let Some(request) = request
             && request.service_code != service_code
@@ -761,6 +840,7 @@ impl Group2Decoder {
 struct ParsedAddress {
     class_id: Option<u32>,
     instance_id: Option<u32>,
+    attribute_id: Option<u32>,
     data_offset: usize,
 }
 
@@ -817,6 +897,7 @@ fn parse_request_address(
                 let logical_path = decode_logical_path(path);
                 parsed.class_id = logical_path.class_id;
                 parsed.instance_id = logical_path.instance_id;
+                parsed.attribute_id = logical_path.attribute_id;
                 if let Some(display) = logical_path.display {
                     analysis.push("Logical path", display);
                 }
@@ -840,6 +921,9 @@ fn parse_request_address(
     }
     if let Some(instance_id) = parsed.instance_id {
         analysis.push("Instance ID", format_u32(instance_id));
+    }
+    if let Some(attribute_id) = parsed.attribute_id {
+        analysis.push("Attribute ID", format_u32(attribute_id));
     }
     if parsed.class_id.is_none()
         && !matches!(
@@ -1044,6 +1128,20 @@ fn attach_request_context(analysis: &mut Group2Analysis, request: Option<&Reques
     if let Some(attribute_id) = request.attribute_id {
         analysis.push("Attribute ID", format_u32(attribute_id));
     }
+}
+
+fn append_attribute_decode(
+    analysis: &mut Group2Analysis,
+    decoded: AttributeDecode,
+) -> Option<PendingAttributeUpdate> {
+    let AttributeDecode {
+        fields,
+        warnings,
+        pending_update,
+    } = decoded;
+    analysis.fields.extend(fields);
+    analysis.warnings.extend(warnings);
+    pending_update
 }
 
 fn function_for_message_id(message_id: u8) -> Group2Function {
@@ -1311,6 +1409,111 @@ mod tests {
     }
 
     #[test]
+    fn decodes_correlated_identity_vendor_information() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message(3, group2_id(3, 4), &[0x0a, 0x0e, 1, 1, 1]),
+            message(4, group2_id(3, 3), &[0x0a, 0x8e, 0x15, 0x07]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+        let response = decoded[3].as_ref().unwrap();
+
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Read target"),
+            Some("Identity instance 1 / Vendor ID")
+        );
+        assert_eq!(response.field("Service data"), Some("15 07"));
+        assert_eq!(
+            response.field("Read target"),
+            Some("Identity instance 1 / Vendor ID")
+        );
+        assert!(
+            response
+                .field("Vendor ID")
+                .is_some_and(|value| value.contains("BLUE DYNAMICS"))
+        );
+    }
+
+    #[test]
+    fn decodes_mbf4_attribute_from_reassembled_packed_epath() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 4]),
+            message(3, group2_id(3, 4), &[0x8a, 0x00, 0x0e, 3, 0x20, 1, 0x24, 1]),
+            message(4, group2_id(3, 4), &[0x8a, 0x81, 0x30, 1]),
+            message(5, group2_id(3, 3), &[0x0a, 0x8e, 0x15, 0x07]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+
+        assert_eq!(
+            decoded[3].as_ref().unwrap().field("Attribute ID"),
+            Some("0x1 (1)")
+        );
+        assert!(
+            decoded[4]
+                .as_ref()
+                .unwrap()
+                .field("Vendor ID")
+                .is_some_and(|value| value.contains("BLUE DYNAMICS"))
+        );
+    }
+
+    #[test]
+    fn applies_set_data_type_only_after_a_success_response() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message(3, group2_id(3, 4), &[0x0a, 0x0e, 0x31, 1, 3]),
+            message(4, group2_id(3, 3), &[0x0a, 0x8e, 0xc3]),
+            message(5, group2_id(3, 4), &[0x0a, 0x10, 0x31, 1, 3, 0xca]),
+            message(6, group2_id(3, 3), &[0x0a, 0x94, 0x14, 0xff]),
+            message(7, group2_id(3, 4), &[0x0a, 0x0e, 0x31, 1, 6]),
+            message(8, group2_id(3, 3), &[0x0a, 0x8e, 7, 0]),
+            message(9, group2_id(3, 4), &[0x0a, 0x10, 0x31, 1, 3, 0xca]),
+            message(10, group2_id(3, 3), &[0x0a, 0x90]),
+            message(11, group2_id(3, 4), &[0x0a, 0x0e, 0x31, 1, 6]),
+            message(12, group2_id(3, 3), &[0x0a, 0x8e, 0, 0, 0x48, 0x41]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+
+        assert_eq!(
+            decoded[4].as_ref().unwrap().field("Write target"),
+            Some("S-Analog Sensor instance 1 / Data type")
+        );
+        assert_eq!(decoded[7].as_ref().unwrap().field("Flow"), Some("7"));
+        assert_eq!(decoded[11].as_ref().unwrap().field("Flow"), Some("12.5"));
+    }
+
+    #[test]
+    fn keeps_first_pending_request_when_group2_xid_is_reused() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message(3, group2_id(3, 4), &[0x0a, 0x0e, 0x31, 1, 3]),
+            message(4, group2_id(3, 3), &[0x0a, 0x8e, 0xc3]),
+            message(5, group2_id(3, 4), &[0x0a, 0x10, 0x31, 1, 3, 0xca]),
+            message(6, group2_id(3, 4), &[0x0a, 0x10, 0x31, 1, 3, 0xc3]),
+            message(7, group2_id(3, 3), &[0x0a, 0x90]),
+            message(8, group2_id(3, 4), &[0x0a, 0x0e, 0x31, 1, 6]),
+            message(9, group2_id(3, 3), &[0x0a, 0x8e, 0x00, 0x00, 0x48, 0x41]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+
+        let collision = decoded[5].as_ref().unwrap();
+        assert!(collision.warnings.iter().any(|warning| {
+            warning.contains("frame #5")
+                && warning.contains("still pending")
+                && warning.contains("not stored")
+        }));
+        assert_eq!(
+            decoded[6].as_ref().unwrap().field("Request frame"),
+            Some("#5")
+        );
+        assert_eq!(decoded[8].as_ref().unwrap().field("Flow"), Some("12.5"));
+    }
+
+    #[test]
     fn reassembles_explicit_fragments_and_decodes_acknowledgments() {
         let messages = vec![
             message(1, group2_id(1, 3), &[0x80, 0x00, 0x8e, 1, 2, 3, 4, 5]),
@@ -1325,6 +1528,21 @@ mod tests {
         assert_eq!(
             decoded[&3].field("Service data"),
             Some("01 02 03 04 05 06 07")
+        );
+    }
+
+    #[test]
+    fn rejects_io_single_fragment_marker_in_explicit_messages() {
+        let decoded =
+            decode_group2_trace_ordered(&[message(1, group2_id(1, 3), &[0x80, 0x3f, 0x8e, 0xaa])]);
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert_eq!(analysis.field("Service"), None);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("first fragment count must be 0"))
         );
     }
 

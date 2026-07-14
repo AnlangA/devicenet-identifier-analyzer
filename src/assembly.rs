@@ -52,7 +52,7 @@ impl IoAssemblyNumericFormat {
     }
 }
 
-/// Supported profile or EDS I/O Assembly instance metadata.
+/// Supported profile or supplied device-table I/O Assembly instance metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IoAssemblyInstance {
     pub number: u8,
@@ -71,7 +71,7 @@ pub struct IoAssemblyInstance {
 impl IoAssemblyInstance {
     pub const fn numeric_format(&self) -> IoAssemblyNumericFormat {
         match self.number {
-            1..=8 | 21 | 22 | 151 | 152 => IoAssemblyNumericFormat::Int,
+            1..=8 | 21 | 22 | 150..=152 => IoAssemblyNumericFormat::Int,
             13..=20 | 23 | 24 => IoAssemblyNumericFormat::Real,
             9..=12 | 25 => IoAssemblyNumericFormat::NoNumericValue,
             _ => IoAssemblyNumericFormat::NoNumericValue,
@@ -98,7 +98,7 @@ pub struct IoAssemblyDecode {
 const MFC_EMFC: &str = "Vol1 6-29 MFC / 6-39 EMFC/EMFM";
 const MFC: &str = "Vol1 6-29 MFC";
 const EMFC: &str = "Vol1 6-39 EMFC/EMFM";
-const GT_EDS: &str = "GT-1000-D EDS + device dictionary";
+const SUPPLIED_DEVICE_TABLE: &str = "MFC/EMFC user-provided device table / R02 mapping";
 
 const REQ_ALL_N: &str = "6-29 MFC: optional (N) · 6-39 EMFC: optional (N) · EMFM: optional (N)";
 const REQ_ALL_DEFAULT: &str = "6-29 MFC: default (D) · 6-39 EMFC: default (D) · EMFM: default (D)";
@@ -108,7 +108,7 @@ const REQ_ALL_Y: &str = "6-29 MFC: required (Y) · 6-39 EMFC: required (Y) · EM
 const REQ_MFC_N_639_UNUSED: &str = "6-29 MFC: optional (N) · 6-39 EMFC/EMFM: Assembly not used";
 const REQ_EMFC_EMFM_Y: &str = "6-39 EMFC: required (Y) · EMFM: required (Y)";
 const REQ_EMFC_EMFM_N: &str = "6-39 EMFC: optional (N) · EMFM: optional (N)";
-const GT_EDS_POLL: &str = "GT-1000-D EDS: declared Poll-compatible vendor Assembly";
+const DEVICE_TABLE_POLL: &str = "User-provided device table: declared Poll-compatible Assembly";
 
 /// Supported device-to-host I/O Assembly instances.
 pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
@@ -203,7 +203,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 14,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status and Flow",
+        name: "Status and FP-Flow",
         profile: MFC_EMFC,
         byte_len: 5,
         requirements: REQ_ALL_Y,
@@ -211,7 +211,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 15,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow and Valve",
+        name: "Status, FP-Flow and FP-Valve",
         profile: MFC_EMFC,
         byte_len: 9,
         requirements: REQ_ALL_N,
@@ -219,7 +219,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 16,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow, and Setpoint",
+        name: "Status, FP-Flow and FP-Setpoint",
         profile: MFC_EMFC,
         byte_len: 9,
         requirements: REQ_ALL_N,
@@ -227,7 +227,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 17,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow, Setpoint and Valve",
+        name: "Status, FP-Flow, FP-Setpoint and FP-Valve",
         profile: MFC_EMFC,
         byte_len: 13,
         requirements: REQ_ALL_N,
@@ -235,7 +235,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 18,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow, Setpoint, Override and Valve",
+        name: "Status, FP-Flow, FP-Setpoint, Override and FP-Valve",
         profile: MFC_EMFC,
         byte_len: 14,
         requirements: REQ_MFC_EMFC_Y_EMFM_N,
@@ -259,7 +259,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 23,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow, Pressure and Temperature",
+        name: "Status, FP-Flow, FP-Pressure and FP-Temperature",
         profile: EMFC,
         byte_len: 13,
         requirements: REQ_EMFC_EMFM_Y,
@@ -267,7 +267,7 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 24,
         direction: IoAssemblyDirection::Input,
-        name: "FP-Status, Flow, Valve, Pressure and Temperature",
+        name: "Status, FP-Flow, FP-Valve, FP-Pressure and FP-Temperature",
         profile: EMFC,
         byte_len: 17,
         requirements: REQ_EMFC_EMFM_N,
@@ -281,12 +281,20 @@ pub const INPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
         requirements: REQ_EMFC_EMFM_N,
     },
     IoAssemblyInstance {
+        number: 150,
+        direction: IoAssemblyDirection::Input,
+        name: "Flow, Valve, Temperature and Pressure",
+        profile: SUPPLIED_DEVICE_TABLE,
+        byte_len: 8,
+        requirements: "R02 I/O mapping from the user-provided device table",
+    },
+    IoAssemblyInstance {
         number: 151,
         direction: IoAssemblyDirection::Input,
         name: "Flow, Valve and Temperature",
-        profile: GT_EDS,
+        profile: SUPPLIED_DEVICE_TABLE,
         byte_len: 6,
-        requirements: GT_EDS_POLL,
+        requirements: DEVICE_TABLE_POLL,
     },
 ];
 
@@ -319,7 +327,7 @@ pub const OUTPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
     IoAssemblyInstance {
         number: 20,
         direction: IoAssemblyDirection::Output,
-        name: "FP-Override and Setpoint",
+        name: "Override and FP-Setpoint",
         profile: MFC_EMFC,
         byte_len: 5,
         requirements: REQ_MFC_EMFC_Y_EMFM_N,
@@ -328,9 +336,9 @@ pub const OUTPUT_ASSEMBLIES: &[IoAssemblyInstance] = &[
         number: 152,
         direction: IoAssemblyDirection::Output,
         name: "Override and Valve",
-        profile: GT_EDS,
+        profile: SUPPLIED_DEVICE_TABLE,
         byte_len: 3,
-        requirements: GT_EDS_POLL,
+        requirements: DEVICE_TABLE_POLL,
     },
 ];
 
@@ -358,7 +366,7 @@ pub fn decode_assembly(
 ) -> Result<IoAssemblyDecode, String> {
     let metadata = assembly_instance(direction, instance).ok_or_else(|| {
         format!(
-            "{} I/O Assembly instance {} is not defined by the supported MFC/EMFC profiles or GT-1000-D EDS",
+            "{} I/O Assembly instance {} is not defined by the supported MFC/EMFC profiles or user-provided device table",
             direction.label(),
             instance
         )
@@ -539,10 +547,16 @@ fn decode_layout(
             exception_detail(cursor, ExceptionKind::Alarm, ExceptionProfile::Emfc);
             exception_detail(cursor, ExceptionKind::Warning, ExceptionProfile::Emfc);
         }
+        (Input, 150) => {
+            device_table_flow_i16(cursor);
+            device_table_valve_i16(cursor);
+            device_table_temperature_i16(cursor);
+            device_table_pressure_i16(cursor);
+        }
         (Input, 151) => {
-            gt_flow_i16(cursor);
-            gt_valve_i16(cursor);
-            gt_temperature_i16(cursor);
+            device_table_flow_i16(cursor);
+            device_table_valve_i16(cursor);
+            device_table_temperature_i16(cursor);
         }
         (Output, 7) => setpoint_i16(cursor),
         (Output, 8) => {
@@ -555,8 +569,8 @@ fn decode_layout(
             setpoint_f32(cursor);
         }
         (Output, 152) => {
-            gt_override_value(cursor);
-            gt_valve_i16(cursor);
+            device_table_override_value(cursor);
+            device_table_valve_i16(cursor);
         }
         _ => {
             return Err(format!(
@@ -650,10 +664,11 @@ const PRESSURE_INT_DESCRIPTION: &str = "CIP INT (signed 16-bit two's-complement,
 const PRESSURE_REAL_DESCRIPTION: &str = "CIP REAL (IEEE 754 binary32, little-endian) pressure mapped to the S-Analog Sensor Object class 0x31, instance 2, attribute 6. Section 6-39 requires Counts and psi support and defaults to Counts; the active Data Units and Full Scale values are not carried in the I/O payload.";
 const TEMPERATURE_INT_DESCRIPTION: &str = "CIP INT (signed 16-bit two's-complement, little-endian) temperature mapped to the S-Analog Sensor Object class 0x31, instance 3, attribute 6. Section 6-39 does not fix one temperature unit; the active Data Units and Full Scale values must be read from the device configuration.";
 const TEMPERATURE_REAL_DESCRIPTION: &str = "CIP REAL (IEEE 754 binary32, little-endian) temperature mapped to the S-Analog Sensor Object class 0x31, instance 3, attribute 6. Section 6-39 does not fix one temperature unit; the active Data Units and Full Scale values must be read from the device configuration.";
-const GT_FLOW_INT_DESCRIPTION: &str = "GT-1000-D vendor Assembly 0x97 Flow. CIP INT (signed 16-bit two's-complement, little-endian), mapped to class 0x31 instance 1 attribute 6. Device data units are Counts (0x1001), sccm (0x1400), or SLM (0x1401). In Counts mode the numeric full scale is 0x6000 and engineering value = raw / 24576 × the configured full scale from class 0x31 instance 1 attribute 0x6E; engineering-unit modes carry their value directly.";
-const GT_VALVE_INT_DESCRIPTION: &str = "GT-1000-D vendor Assembly valve value. CIP INT (signed 16-bit two's-complement, little-endian), mapped to class 0x32 instance 1 attribute 6. Device data units are Counts (0x1001) or percent (0x1007). GT Counts full scale is 0x7FFF; percent = raw / 32767 × 100 when converting a Counts value. This GT rule intentionally differs from the older MC-DG8xx 0x6000 valve full scale.";
-const GT_TEMPERATURE_INT_DESCRIPTION: &str = "GT-1000-D vendor Assembly 0x97 Temperature. CIP INT (signed 16-bit two's-complement, little-endian), mapped to class 0x31 instance 3 attribute 6. Device data units are Counts (0x1001), degrees Celsius (0x1200), or kelvin (0x1202). In Counts mode the numeric full scale is 0x6000 and conversion also requires the configured engineering full scale from class 0x31 instance 3 attribute 0x6E.";
-const GT_OVERRIDE_DESCRIPTION: &str = "GT-1000-D vendor Assembly 0x98 Override, mapped to class 0x32 instance 1 attribute 5. The current device dictionary defines 0 Normal, 1 Close, 2 Open, and 3 Hold; values 4-255 are not defined by that dictionary.";
+const DEVICE_TABLE_FLOW_INT_DESCRIPTION: &str = "User-provided device-table Assemblies 150/151 Flow. CIP INT (signed 16-bit two's-complement, little-endian), mapped to MFC/EMFC S-Analog Sensor class 0x31 instance 1 attribute 6. Data units are Counts (0x1001), sccm (0x1400), or SLM (0x1401). In Counts mode the documented numeric full scale is 0x6000 and engineering value = raw / 24576 × the configured full scale from class 0x31 instance 1 attribute 0x6E; engineering-unit modes carry their value directly.";
+const DEVICE_TABLE_VALVE_INT_DESCRIPTION: &str = "User-provided device-table Assemblies 150-152 valve value. CIP INT (signed 16-bit two's-complement, little-endian), mapped to MFC/EMFC S-Analog Actuator class 0x32 instance 1 attribute 6. Data units are Counts (0x1001) or percent (0x1007). The supplied table defines a Counts full scale of 0x7FFF; percent = raw / 32767 × 100 when converting a Counts value.";
+const DEVICE_TABLE_TEMPERATURE_INT_DESCRIPTION: &str = "User-provided device-table Assemblies 150/151 Temperature. CIP INT (signed 16-bit two's-complement, little-endian), mapped to MFC/EMFC S-Analog Sensor class 0x31 instance 3 attribute 6. Data units are Counts (0x1001), degrees Celsius (0x1200), or kelvin (0x1202). In Counts mode the documented numeric full scale is 0x6000 and conversion also requires the configured engineering full scale from class 0x31 instance 3 attribute 0x6E.";
+const DEVICE_TABLE_PRESSURE_INT_DESCRIPTION: &str = "User-provided R02 Assembly 150 Pressure. CIP INT (signed 16-bit two's-complement, little-endian), mapped to MFC/EMFC S-Analog Sensor class 0x31 instance 2 attribute 6. Data units are Counts (0x1001), kPa (0x130A), psi (0x1300), or torr (0x1301). Counts conversion requires the instance 2 Numeric Full Scale and configured full scale attribute 0x6E; neither is carried in the I/O payload.";
+const DEVICE_TABLE_OVERRIDE_DESCRIPTION: &str = "User-provided device-table Assembly 152 Override, mapped to MFC/EMFC S-Analog Actuator class 0x32 instance 1 attribute 5. The supplied table defines 0 Normal, 1 Close, 2 Open, and 3 Hold; values 4-255 are not defined by that table.";
 
 fn status(cursor: &mut DecodeCursor<'_>) {
     cursor.push_u8(
@@ -753,36 +768,44 @@ fn temperature_f32(cursor: &mut DecodeCursor<'_>) {
     );
 }
 
-fn gt_flow_i16(cursor: &mut DecodeCursor<'_>) {
+fn device_table_flow_i16(cursor: &mut DecodeCursor<'_>) {
     cursor.push_i16(
         "Flow",
-        "GT device-configured Data Units (default: Counts)",
-        GT_FLOW_INT_DESCRIPTION,
+        "device-configured Data Units (table default: Counts)",
+        DEVICE_TABLE_FLOW_INT_DESCRIPTION,
     );
 }
 
-fn gt_valve_i16(cursor: &mut DecodeCursor<'_>) {
+fn device_table_valve_i16(cursor: &mut DecodeCursor<'_>) {
     cursor.push_i16(
         "Valve",
-        "GT device-configured Data Units (default: Counts)",
-        GT_VALVE_INT_DESCRIPTION,
+        "device-configured Data Units (table default: Counts)",
+        DEVICE_TABLE_VALVE_INT_DESCRIPTION,
     );
 }
 
-fn gt_temperature_i16(cursor: &mut DecodeCursor<'_>) {
+fn device_table_temperature_i16(cursor: &mut DecodeCursor<'_>) {
     cursor.push_i16(
         "Temperature",
-        "GT device-configured Data Units (default: Counts)",
-        GT_TEMPERATURE_INT_DESCRIPTION,
+        "device-configured Data Units (table default: Counts)",
+        DEVICE_TABLE_TEMPERATURE_INT_DESCRIPTION,
     );
 }
 
-fn gt_override_value(cursor: &mut DecodeCursor<'_>) {
+fn device_table_pressure_i16(cursor: &mut DecodeCursor<'_>) {
+    cursor.push_i16(
+        "Pressure",
+        "device-configured Data Units (table default: Counts)",
+        DEVICE_TABLE_PRESSURE_INT_DESCRIPTION,
+    );
+}
+
+fn device_table_override_value(cursor: &mut DecodeCursor<'_>) {
     cursor.push_u8(
         "Override",
         "enumerated value (USINT)",
-        GT_OVERRIDE_DESCRIPTION,
-        |value| format!("{value} ({})", gt_override_label(value)),
+        DEVICE_TABLE_OVERRIDE_DESCRIPTION,
+        |value| format!("{value} ({})", device_table_override_label(value)),
     );
 }
 
@@ -837,13 +860,13 @@ fn override_label(value: u8) -> &'static str {
     }
 }
 
-fn gt_override_label(value: u8) -> &'static str {
+fn device_table_override_label(value: u8) -> &'static str {
     match value {
         0 => "Normal",
         1 => "Close",
         2 => "Open",
         3 => "Hold",
-        4..=255 => "Undefined by GT dictionary",
+        4..=255 => "Undefined by supplied device table",
     }
 }
 
@@ -1075,6 +1098,7 @@ mod tests {
             (23, 13),
             (24, 17),
             (25, 17),
+            (150, 8),
             (151, 6),
         ];
         let output = [(7, 2), (8, 3), (19, 4), (20, 5), (152, 3)];
@@ -1143,7 +1167,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_gt_vendor_assemblies_with_device_specific_full_scale_context() {
+    fn decodes_supplied_device_table_assemblies_with_full_scale_context() {
         let input = decode_assembly(
             IoAssemblyDirection::Input,
             151,
@@ -1160,13 +1184,20 @@ mod tests {
         );
         assert!(component(&input, "Valve").description.contains("0x7FFF"));
 
+        let r02 =
+            decode_assembly(IoAssemblyDirection::Input, 150, &[1, 0, 2, 0, 3, 0, 4, 0]).unwrap();
+        assert_eq!(component(&r02, "Flow").value, "1");
+        assert_eq!(component(&r02, "Valve").value, "2");
+        assert_eq!(component(&r02, "Temperature").value, "3");
+        assert_eq!(component(&r02, "Pressure").value, "4");
+
         let output = decode_assembly(IoAssemblyDirection::Output, 152, &[3, 0xff, 0x7f]).unwrap();
         assert_eq!(component(&output, "Override").value, "3 (Hold)");
         assert_eq!(component(&output, "Valve").value, "32767");
         assert!(
             component(&output, "Override")
                 .description
-                .contains("GT-1000-D")
+                .contains("device-table Assembly 152")
         );
     }
 
