@@ -135,7 +135,7 @@ pub(crate) fn decode_common_service_data(
         }
         0x08 if is_response => {
             if let Some(instance) = read_u16(data, 0) {
-                details.push("Created Instance ID", format_u16(instance));
+                details.push("Created Instance ID (default UINT)", format_u16(instance));
                 raw_if_any(&mut details, "Object-specific data", &data[2..]);
             } else {
                 details.warn("Create response is missing the 16-bit Instance ID");
@@ -170,7 +170,7 @@ pub(crate) fn decode_common_service_data(
             }
         }
         0x18..=0x1b if is_response || member_address_in_service_data => {
-            decode_member_service(is_response, data, &mut details)
+            decode_member_service(code, is_response, data, &mut details)
         }
         0x18..=0x1b => raw_if_any(&mut details, "Member data", data),
         0x1c if is_response => {
@@ -268,6 +268,16 @@ fn decode_multiple_service_packet(is_response: bool, data: &[u8], details: &mut 
     let offsets = (0..count)
         .map(|index| read_u16(data, 2 + index * 2).unwrap())
         .collect::<Vec<_>>();
+    let table_end = 2 + offset_bytes;
+    if offsets
+        .first()
+        .is_some_and(|offset| usize::from(*offset) != table_end)
+    {
+        details.warn(format!("First embedded item offset must be {table_end}"));
+    }
+    if offsets.windows(2).any(|pair| pair[0] >= pair[1]) {
+        details.warn("Embedded item offsets must be strictly increasing");
+    }
     details.push(
         if is_response {
             "Response offsets"
@@ -296,6 +306,26 @@ fn decode_multiple_service_packet(is_response: bool, data: &[u8], details: &mut 
                 let reply = item[0] & 0x7f;
                 let status = item[2];
                 let additional_words = item[3];
+                if item[0] & 0x80 == 0 {
+                    details.warn(format!(
+                        "Embedded response {} does not set the Reply Service bit",
+                        index + 1
+                    ));
+                }
+                if item[1] != 0 {
+                    details.warn(format!(
+                        "Embedded response {} reserved byte must be zero",
+                        index + 1
+                    ));
+                }
+                let minimum = 4 + usize::from(additional_words) * 2;
+                if item.len() < minimum {
+                    details.warn(format!(
+                        "Embedded response {} additional status is truncated",
+                        index + 1
+                    ));
+                    continue;
+                }
                 details.push(
                     format!("Embedded response {}", index + 1),
                     format!(
@@ -308,6 +338,17 @@ fn decode_multiple_service_packet(is_response: bool, data: &[u8], details: &mut 
             }
         } else if item.len() >= 2 {
             let service = item[0] & 0x7f;
+            if item[0] & 0x80 != 0 {
+                details.warn(format!(
+                    "Embedded request {} sets the Reply Service bit",
+                    index + 1
+                ));
+            }
+            let minimum = 2 + usize::from(item[1]) * 2;
+            if item.len() < minimum {
+                details.warn(format!("Embedded request {} path is truncated", index + 1));
+                continue;
+            }
             details.push(
                 format!("Embedded request {}", index + 1),
                 format!(
@@ -359,7 +400,7 @@ fn decode_find_next(is_response: bool, data: &[u8], details: &mut ServiceDetails
     }
 }
 
-fn decode_member_service(is_response: bool, data: &[u8], details: &mut ServiceDetails) {
+fn decode_member_service(code: u8, is_response: bool, data: &[u8], details: &mut ServiceDetails) {
     if is_response {
         raw_if_any(details, "Member response data", data);
         return;
@@ -403,11 +444,23 @@ fn decode_member_service(is_response: bool, data: &[u8], details: &mut ServiceDe
             details.warn("Extended member request is missing its protocol ID");
         }
     }
-    raw_if_any(
-        details,
-        "Member data",
-        data.get(offset..).unwrap_or_default(),
-    );
+    let member_data = data.get(offset..).unwrap_or_default();
+    match code {
+        0x18 | 0x1b if !member_data.is_empty() => {
+            details.warn(format!(
+                "{} request must not contain Member Data",
+                service_name(code)
+            ));
+        }
+        0x19 if member_data.is_empty() => {
+            details.warn(format!(
+                "{} request requires Member Data",
+                service_name(code)
+            ));
+        }
+        _ => {}
+    }
+    raw_if_any(details, "Member data", member_data);
 }
 
 fn decode_connection_point_members(data: &[u8], details: &mut ServiceDetails) {
@@ -530,5 +583,29 @@ mod tests {
 
         let find = decode_common_service_data(0x11, true, &[2, 1, 0, 8, 0], false);
         assert_eq!(find.fields[1].1, "0x0001 (1), 0x0008 (8)");
+    }
+
+    #[test]
+    fn validates_multiple_service_packet_and_member_boundaries() {
+        // Volume 1, A-4.20: Insert_Member data is optional, while Set_Member
+        // requires it. Get/Remove requests must not carry Member Data.
+        let insert = decode_common_service_data(0x1a, false, &[1, 2, 0], true);
+        assert!(insert.warnings.is_empty());
+        let set = decode_common_service_data(0x19, false, &[1, 2, 0], true);
+        assert!(
+            set.warnings
+                .iter()
+                .any(|warning| warning.contains("requires Member Data"))
+        );
+
+        // One embedded request at offset 4 whose service byte incorrectly
+        // carries the reply bit.
+        let multiple = decode_common_service_data(0x0a, false, &[1, 0, 4, 0, 0x8e, 0], false);
+        assert!(
+            multiple
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Reply Service bit"))
+        );
     }
 }

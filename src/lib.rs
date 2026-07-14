@@ -3,18 +3,56 @@
 use std::cmp::Ordering;
 use std::fmt;
 
+mod analysis;
+mod explicit;
 mod group2;
+mod path;
 mod protocol;
 mod services;
+mod status;
 
+pub use analysis::DecodedField;
+pub use explicit::MessageBodyFormat;
+#[allow(deprecated)]
 pub use group2::{
-    DecodedField, Group2Analysis, Group2Function, MessageBodyFormat, decode_group2_trace,
-    decode_group2_trace_ordered,
+    Group2Analysis, Group2Function, decode_group2_trace, decode_group2_trace_ordered,
 };
+#[allow(deprecated)]
 pub use protocol::{FrameAnalysis, FrameFunction, decode_trace, decode_trace_ordered};
 pub use services::{service_description, service_name};
 
 pub const MAX_STANDARD_IDENTIFIER: u16 = 0x7ff;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceMessageError {
+    IdentifierOutOfRange(u32),
+    DlcOutOfRange(usize),
+    DlcMismatch { dlc: usize, data_len: usize },
+    InvalidTime,
+}
+
+impl fmt::Display for TraceMessageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IdentifierOutOfRange(identifier) => write!(
+                f,
+                "CAN Identifier 0x{identifier:X} exceeds the 11-bit range 0x000-0x7FF"
+            ),
+            Self::DlcOutOfRange(dlc) => {
+                write!(f, "Classic CAN DLC {dlc} exceeds the maximum of 8")
+            }
+            Self::DlcMismatch { dlc, data_len } => write!(
+                f,
+                "declared DLC {dlc} does not match the {data_len} supplied data bytes"
+            ),
+            Self::InvalidTime => {
+                write!(f, "time offset must be a finite, non-negative value")
+            }
+        }
+    }
+}
+
+impl std::error::Error for TraceMessageError {}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceMessage {
@@ -29,6 +67,50 @@ pub struct TraceMessage {
 }
 
 impl TraceMessage {
+    pub fn try_new(
+        number: u64,
+        time_offset_ms: Option<f64>,
+        bus: u32,
+        direction: impl Into<String>,
+        identifier: u32,
+        dlc: usize,
+        data: Vec<u8>,
+    ) -> Result<Self, TraceMessageError> {
+        let message = Self {
+            number,
+            time_offset_ms,
+            bus,
+            direction: direction.into(),
+            identifier,
+            dlc,
+            data,
+        };
+        message.validate()?;
+        Ok(message)
+    }
+
+    pub fn validate(&self) -> Result<(), TraceMessageError> {
+        if self.identifier > MAX_STANDARD_IDENTIFIER as u32 {
+            return Err(TraceMessageError::IdentifierOutOfRange(self.identifier));
+        }
+        if self.dlc > 8 {
+            return Err(TraceMessageError::DlcOutOfRange(self.dlc));
+        }
+        if self.dlc != self.data.len() {
+            return Err(TraceMessageError::DlcMismatch {
+                dlc: self.dlc,
+                data_len: self.data.len(),
+            });
+        }
+        if self
+            .time_offset_ms
+            .is_some_and(|time| !time.is_finite() || time < 0.0)
+        {
+            return Err(TraceMessageError::InvalidTime);
+        }
+        Ok(())
+    }
+
     pub fn decoded_identifier(&self) -> Result<DecodedIdentifier, ParseError> {
         if self.identifier > MAX_STANDARD_IDENTIFIER as u32 {
             return Err(ParseError::OutOfRange(self.identifier));
@@ -109,6 +191,9 @@ pub fn parse_trace_log(contents: &str) -> TraceLog {
             let bus = fields[2].parse::<u32>().ok()?;
             let identifier = u32::from_str_radix(fields[4], 16).ok()?;
             let dlc = fields[5].parse::<usize>().ok()?;
+            if fields.len() != 6 + dlc {
+                return None;
+            }
             let data = fields
                 .iter()
                 .skip(6)
@@ -117,15 +202,16 @@ pub fn parse_trace_log(contents: &str) -> TraceLog {
                 .collect::<Result<Vec<_>, _>>()
                 .ok()?;
 
-            Some(TraceMessage {
+            TraceMessage::try_new(
                 number,
-                time_offset_ms: Some(time_offset_ms),
+                Some(time_offset_ms),
                 bus,
-                direction: fields[3].to_owned(),
+                fields[3],
                 identifier,
                 dlc,
                 data,
-            })
+            )
+            .ok()
         })();
 
         match parsed {
@@ -203,23 +289,17 @@ fn parse_key_value_trace_message(line: &str, fallback_number: u64) -> Option<Tra
     }
 
     let identifier = identifier?;
-    if identifier > MAX_STANDARD_IDENTIFIER as u32 || data.len() > 8 {
-        return None;
-    }
     let dlc = declared_dlc.unwrap_or(data.len());
-    if dlc != data.len() || dlc > 8 {
-        return None;
-    }
-
-    Some(TraceMessage {
-        number: number.unwrap_or(fallback_number),
+    TraceMessage::try_new(
+        number.unwrap_or(fallback_number),
         time_offset_ms,
         bus,
         direction,
         identifier,
         dlc,
         data,
-    })
+    )
+    .ok()
 }
 
 fn parse_can_identifier(value: &str) -> Option<u32> {
@@ -602,5 +682,23 @@ No=1,Time=2.0,Bus=1,Dir=Rx,ID=0x40B,Type=D,DLC=1,Data=AA ,Source=File
             std::cmp::Ordering::Greater
         );
         assert_eq!(compare_optional_time(None, None), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn rejects_invalid_whitespace_trace_rows_consistently() {
+        let trace = r#"
+1 -1.0 1 Tx 400 0
+2  1.0 1 Tx 800 0
+3  2.0 1 Tx 400 9 00 01 02 03 04 05 06 07 08
+4  3.0 1 Tx 400 2 AA
+5  4.0 1 Tx 400 1 BB CC
+6  5.0 1 Tx 400 1 DD
+"#;
+
+        let parsed = parse_trace_log(trace);
+        assert_eq!(parsed.skipped_message_lines, 5);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].number, 6);
+        assert_eq!(parsed.messages[0].data, [0xdd]);
     }
 }

@@ -6,7 +6,8 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 
 ## Features
 
-- Group 1: `0x000-0x3FF`; all 16 connection-specific Message IDs
+- Group 1: `0x000-0x3FF`; all identifier fields plus the fixed Predefined
+  Controller/Device Connection Set functions for Message IDs `0xC-0xF`
 - Group 2: `0x400-0x5FF`; all eight predefined Group 2 Only functions
 - Group 3: `0x600-0x7BF`; connection-specific IDs 0-4, UCMM response/request IDs 5/6,
   and invalid ID 7 validation
@@ -25,6 +26,8 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 - Acknowledged Explicit Message fragmentation, acknowledgment, and reassembly
 - Group 3 UCMM Open/Close/Error, Heartbeat, and Shutdown decoding
 - Stateful UCMM Open correlation that learns dynamic Group 1/2/3 Explicit Connection IDs
+- Dynamic Group 2 connections take precedence over the fixed Section 3-7 mapping without
+  contaminating the predefined Group 2 state machine
 - Connected Explicit request/response, fragmentation, object address, and request correlation
   across every learned Message Group
 - All CIP common Service Codes from Volume 1 Appendix A, including fixed request/response
@@ -37,9 +40,11 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 - API keys remain in memory only
 - Plain-text export of only the frames created manually or through AI
 
-The message decoder follows DeviceNet Volume 3 Edition 1.16 and the CIP common service
-definitions in Volume 1 Edition 3.37. I/O payloads and object/class-specific service tails remain
-raw because their formats are defined by the application or addressed object, not by DeviceNet.
+The message decoder is checked against DeviceNet Volume 3 Edition 1.16 and the CIP common
+service definitions in Volume 1 Edition 3.37. In particular, Volume 3 Section 3-7 identifier
+roles and mappings have dedicated regression tests. I/O payloads and object/class-specific
+service tails remain raw when their layouts are not defined by the identifier mapping or common
+service specification.
 
 ## Run
 
@@ -71,6 +76,10 @@ the complete entry window scrolls on smaller displays.
 ## Architecture
 
 - `src/lib.rs`: trace parsing and 11-bit DeviceNet identifier model
+- `src/analysis.rs`: shared typed decoded-field presentation model
+- `src/explicit.rs`: shared Explicit Message header, body-format, and fragmentation primitives
+- `src/path.rs`: shared Packed EPATH logical-segment decoding
+- `src/status.rs`: complete CIP General Status metadata from Volume 1 Appendix B
 - `src/group2.rs`: stateful predefined Group 2 Only protocol decoder
 - `src/protocol.rs`: unified Group 1-4, UCMM, dynamic connection, and Offline Connection Set decoder
 - `src/services.rs`: CIP common Service Code metadata and service-data decoder
@@ -82,7 +91,13 @@ the complete entry window scrolls on smaller displays.
 
 The UI addresses messages by their stable source index instead of the display
 message number. Duplicate frame numbers therefore cannot overwrite decoder
-results or collide with UI state.
+results or collide with UI state. Each source frame, analysis, and origin is held
+in one `AnalyzedFrame`, eliminating parallel-vector indexing invariants.
+
+Use the unified `decode_trace_ordered` library API when UCMM-allocated Group 2
+connections may be present. The standalone Group 2 decoder intentionally has no
+UCMM connection context, and map-based compatibility APIs are lossy when display
+frame numbers repeat.
 
 ## Supported single-frame input formats
 

@@ -2,7 +2,9 @@
 name = "devicenet-identifier-analyzer"
 version = "0.1.0"
 edition = "2024"
-description = "DeviceNet 11-bit CAN identifier group analyzer"
+rust-version = "1.85"
+description = "DeviceNet trace analyzer for 11-bit CAN identifiers and explicit messaging"
+repository = "https://github.com/AnlangA/devicenet-identifier-analyzer"
 
 [[bin]]
 name = "devicenet-identifier-analyzer"
@@ -11,7 +13,7 @@ bench = false
 
 [dependencies]
 eframe = { version = "0.35", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
-rfd = "0.15"
+rfd = { version = "0.15", default-features = false, features = ["tokio", "xdg-portal"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.52", features = ["rt", "time"] }

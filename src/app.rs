@@ -2,13 +2,12 @@ use crate::ai_import::{AiEndpoint, AiImportOutput, AiImportRequest, request_can_
 use crate::frame_input::{FrameOrigin, NewCanFrame, format_saved_frame};
 use crate::theme;
 use devicenet_identifier_analyzer::{
-    FrameAnalysis, MessageGroup, TraceLog, TraceMessage, compare_optional_time,
-    decode_trace_ordered, parse_trace_log,
+    FrameAnalysis, MessageGroup, TraceMessage, compare_optional_time, decode_trace_ordered,
+    parse_trace_log,
 };
 use eframe::egui;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SortOrder {
@@ -102,25 +101,24 @@ pub(crate) struct TraceStats {
     pub(crate) group3: usize,
     pub(crate) group4: usize,
     pub(crate) warnings: usize,
+    pub(crate) user_created: usize,
     pub(crate) duration_ms: f64,
 }
 
 impl TraceStats {
-    fn from_trace(trace: &TraceLog, analyses: &[Option<FrameAnalysis>]) -> Self {
-        let tx = trace
-            .messages
+    fn from_frames(frames: &[AnalyzedFrame]) -> Self {
+        let tx = frames
             .iter()
-            .filter(|message| message.direction.eq_ignore_ascii_case("Tx"))
+            .filter(|frame| frame.message.direction.eq_ignore_ascii_case("Tx"))
             .count();
-        let rx = trace
-            .messages
+        let rx = frames
             .iter()
-            .filter(|message| message.direction.eq_ignore_ascii_case("Rx"))
+            .filter(|frame| frame.message.direction.eq_ignore_ascii_case("Rx"))
             .count();
         let count_group = |group| {
-            analyses
+            frames
                 .iter()
-                .flatten()
+                .filter_map(|frame| frame.analysis.as_ref())
                 .filter(|analysis| analysis.group == group)
                 .count()
         };
@@ -128,15 +126,18 @@ impl TraceStats {
         let group2 = count_group(MessageGroup::Group2);
         let group3 = count_group(MessageGroup::Group3);
         let group4 = count_group(MessageGroup::Group4);
-        let warnings = analyses
+        let warnings = frames
             .iter()
-            .flatten()
+            .filter_map(|frame| frame.analysis.as_ref())
             .map(|analysis| analysis.warnings.len())
             .sum();
-        let mut times = trace
-            .messages
+        let user_created = frames
             .iter()
-            .filter_map(|message| message.time_offset_ms);
+            .filter(|frame| frame.origin.is_user_created())
+            .count();
+        let mut times = frames
+            .iter()
+            .filter_map(|frame| frame.message.time_offset_ms);
         let duration_ms = times.next().map_or(0.0, |first| {
             let (minimum, maximum) = times.fold((first, first), |(minimum, maximum), time| {
                 (minimum.min(time), maximum.max(time))
@@ -152,16 +153,23 @@ impl TraceStats {
             group3,
             group4,
             warnings,
+            user_created,
             duration_ms,
         }
     }
 }
 
+pub(crate) struct AnalyzedFrame {
+    pub(crate) message: TraceMessage,
+    pub(crate) analysis: Option<FrameAnalysis>,
+    pub(crate) origin: FrameOrigin,
+    search_text: String,
+}
+
 pub(crate) struct TraceDocument {
     pub(crate) path: PathBuf,
-    pub(crate) trace: TraceLog,
-    pub(crate) analyses: Vec<Option<FrameAnalysis>>,
-    pub(crate) origins: Vec<FrameOrigin>,
+    pub(crate) frames: Vec<AnalyzedFrame>,
+    pub(crate) skipped_message_lines: usize,
     pub(crate) stats: TraceStats,
 }
 
@@ -194,6 +202,30 @@ struct AiJob {
 }
 
 impl TraceDocument {
+    fn from_messages(
+        path: PathBuf,
+        messages: Vec<TraceMessage>,
+        origins: Vec<FrameOrigin>,
+    ) -> Self {
+        let frames = analyze_frames(messages, origins);
+        let stats = TraceStats::from_frames(&frames);
+        Self {
+            path,
+            frames,
+            skipped_message_lines: 0,
+            stats,
+        }
+    }
+
+    fn reanalyze(&mut self) {
+        let (messages, origins) = std::mem::take(&mut self.frames)
+            .into_iter()
+            .map(|frame| (frame.message, frame.origin))
+            .unzip();
+        self.frames = analyze_frames(messages, origins);
+        self.stats = TraceStats::from_frames(&self.frames);
+    }
+
     pub(crate) fn file_name(&self) -> &str {
         self.path
             .file_name()
@@ -206,11 +238,14 @@ pub(crate) struct AnalyzerApp {
     pub(crate) document: Option<TraceDocument>,
     pub(crate) selected_index: Option<usize>,
     pub(crate) visible_indices: Vec<usize>,
+    pub(crate) rendered_row_range: std::ops::Range<usize>,
+    pub(crate) scroll_to_position: Option<usize>,
     pub(crate) filters: MessageFilters,
     pub(crate) sort_order: SortOrder,
     pub(crate) load_error: Option<String>,
     pub(crate) operation_message: Option<Result<String, String>>,
     pub(crate) show_input_window: bool,
+    pub(crate) input_needs_focus: bool,
     pub(crate) input_tab: InputTab,
     pub(crate) manual_input: ManualInputForm,
     pub(crate) ai_input: AiInputForm,
@@ -224,11 +259,14 @@ impl AnalyzerApp {
             document: None,
             selected_index: None,
             visible_indices: Vec::new(),
+            rendered_row_range: 0..0,
+            scroll_to_position: None,
             filters: MessageFilters::default(),
             sort_order: SortOrder::Ascending,
             load_error: None,
             operation_message: None,
             show_input_window: false,
+            input_needs_focus: false,
             input_tab: InputTab::Manual,
             manual_input: ManualInputForm::default(),
             ai_input: AiInputForm::default(),
@@ -242,26 +280,23 @@ impl AnalyzerApp {
     }
 
     pub(crate) fn load_file(&mut self, path: PathBuf) {
+        self.load_error = None;
+        self.operation_message = None;
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
                 let trace = parse_trace_log(&contents);
                 if trace.messages.is_empty() {
-                    self.load_error = Some(format!(
-                        "No PCAN trace messages were found in {}",
+                    self.load_error = Some(self.retained_trace_error(format!(
+                        "No valid PCAN trace messages were found in {}",
                         path.display()
-                    ));
+                    )));
                     return;
                 }
 
-                let analyses = decode_trace_ordered(&trace.messages);
-                let stats = TraceStats::from_trace(&trace, &analyses);
-                self.document = Some(TraceDocument {
-                    path,
-                    origins: vec![FrameOrigin::File; trace.messages.len()],
-                    trace,
-                    analyses,
-                    stats,
-                });
+                let origins = vec![FrameOrigin::File; trace.messages.len()];
+                let mut document = TraceDocument::from_messages(path, trace.messages, origins);
+                document.skipped_message_lines = trace.skipped_message_lines;
+                self.document = Some(document);
                 self.filters = MessageFilters::default();
                 self.sort_order = SortOrder::Ascending;
                 self.selected_index = Some(0);
@@ -269,9 +304,22 @@ impl AnalyzerApp {
                 self.refresh_visible_indices();
             }
             Err(error) => {
-                self.load_error = Some(format!("Could not read {}: {error}", path.display()));
+                self.load_error =
+                    Some(self.retained_trace_error(format!(
+                        "Could not read {}: {error}",
+                        path.display()
+                    )));
             }
         }
+    }
+
+    fn retained_trace_error(&self, error: String) -> String {
+        self.document.as_ref().map_or(error.clone(), |document| {
+            format!(
+                "{error}. The current trace ({}) is still displayed.",
+                document.file_name()
+            )
+        })
     }
 
     pub(crate) fn toggle_sort_order(&mut self) {
@@ -286,29 +334,26 @@ impl AnalyzerApp {
         let Some(document) = &self.document else {
             self.visible_indices.clear();
             self.selected_index = None;
+            self.rendered_row_range = 0..0;
+            self.scroll_to_position = None;
             return;
         };
 
         let query = self.filters.query.trim().to_ascii_uppercase();
         self.visible_indices = document
-            .trace
-            .messages
+            .frames
             .iter()
             .enumerate()
-            .filter(|(index, message)| {
-                direction_matches(message, self.filters.direction)
-                    && scope_matches(
-                        message,
-                        document.analyses[*index].as_ref(),
-                        self.filters.scope,
-                    )
-                    && query_matches(message, document.analyses[*index].as_ref(), query.as_str())
+            .filter(|(_, frame)| {
+                direction_matches(&frame.message, self.filters.direction)
+                    && scope_matches(&frame.message, frame.analysis.as_ref(), self.filters.scope)
+                    && frame.search_text.contains(query.as_str())
             })
             .map(|(index, _)| index)
             .collect();
         self.visible_indices.sort_by(|left_index, right_index| {
-            let left = &document.trace.messages[*left_index];
-            let right = &document.trace.messages[*right_index];
+            let left = &document.frames[*left_index].message;
+            let right = &document.frames[*right_index].message;
             let chronological = compare_optional_time(left.time_offset_ms, right.time_offset_ms);
             let ordered = match (left.time_offset_ms, right.time_offset_ms, self.sort_order) {
                 (Some(_), Some(_), SortOrder::Descending) => chronological.reverse(),
@@ -322,6 +367,7 @@ impl AnalyzerApp {
         {
             self.selected_index = self.visible_indices.first().copied();
         }
+        self.scroll_to_position = self.selected_position();
     }
 
     pub(crate) fn selected_position(&self) -> Option<usize> {
@@ -340,14 +386,19 @@ impl AnalyzerApp {
         let last = self.visible_indices.len().saturating_sub(1) as isize;
         let next = (current + delta).clamp(0, last) as usize;
         self.selected_index = Some(self.visible_indices[next]);
+        if !self.rendered_row_range.contains(&next) {
+            self.scroll_to_position = Some(next);
+        }
     }
 
     pub(crate) fn select_boundary(&mut self, first: bool) {
-        self.selected_index = if first {
-            self.visible_indices.first().copied()
+        let position = if first {
+            0
         } else {
-            self.visible_indices.last().copied()
+            self.visible_indices.len().saturating_sub(1)
         };
+        self.selected_index = self.visible_indices.get(position).copied();
+        self.scroll_to_position = self.selected_index.map(|_| position);
     }
 
     pub(crate) fn selected_source_index(&self) -> Option<usize> {
@@ -362,8 +413,12 @@ impl AnalyzerApp {
         );
         match parsed {
             Ok(frame) => {
-                self.insert_frames(vec![frame], FrameOrigin::Manual);
-                self.manual_input.message = Some(Ok("Frame inserted".into()));
+                let visible = self.insert_frames(vec![frame], FrameOrigin::Manual);
+                self.manual_input.message = Some(Ok(if visible {
+                    "Frame inserted".into()
+                } else {
+                    "Frame inserted, but hidden by the current filters".into()
+                }));
                 self.manual_input.time_ms.clear();
                 self.manual_input.can_id.clear();
                 self.manual_input.can_data.clear();
@@ -405,7 +460,7 @@ impl AnalyzerApp {
         });
     }
 
-    pub(crate) fn poll_ai_job(&mut self, ctx: &egui::Context) {
+    pub(crate) fn poll_ai_job(&mut self) {
         let Some(result) = self.ai_job.as_ref().map(|job| job.receiver.try_recv()) else {
             return;
         };
@@ -413,16 +468,22 @@ impl AnalyzerApp {
             Ok(Ok(output)) => {
                 let count = output.frames.len();
                 self.ai_input.last_json = output.pretty_json;
-                self.insert_frames(output.frames, FrameOrigin::Ai);
-                self.ai_input.message =
-                    Some(Ok(format!("Inserted {count} AI-structured frame(s)")));
+                let visible = self.insert_frames(output.frames, FrameOrigin::Ai);
+                self.ai_input.message = Some(Ok(format!(
+                    "Inserted {count} AI-structured frame(s){}",
+                    if visible {
+                        ""
+                    } else {
+                        ", but the first is hidden by the current filters"
+                    }
+                )));
                 self.ai_job = None;
             }
             Ok(Err(error)) => {
                 self.ai_input.message = Some(Err(error));
                 self.ai_job = None;
             }
-            Err(TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(100)),
+            Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.ai_input.message = Some(Err("AI worker stopped unexpectedly".into()));
                 self.ai_job = None;
@@ -435,13 +496,9 @@ impl AnalyzerApp {
     }
 
     pub(crate) fn user_created_count(&self) -> usize {
-        self.document.as_ref().map_or(0, |document| {
-            document
-                .origins
-                .iter()
-                .filter(|origin| origin.is_user_created())
-                .count()
-        })
+        self.document
+            .as_ref()
+            .map_or(0, |document| document.stats.user_created)
     }
 
     pub(crate) fn save_user_frames(&mut self, mut path: PathBuf) {
@@ -451,12 +508,10 @@ impl AnalyzerApp {
             return;
         };
         let lines = document
-            .trace
-            .messages
+            .frames
             .iter()
-            .zip(&document.origins)
-            .filter(|(_, origin)| origin.is_user_created())
-            .map(|(message, origin)| format_saved_frame(message, *origin))
+            .filter(|frame| frame.origin.is_user_created())
+            .map(|frame| format_saved_frame(&frame.message, frame.origin))
             .collect::<Vec<_>>();
         if lines.is_empty() {
             self.operation_message = Some(Err(
@@ -483,47 +538,65 @@ impl AnalyzerApp {
         }
     }
 
-    fn insert_frames(&mut self, frames: Vec<NewCanFrame>, origin: FrameOrigin) {
+    fn insert_frames(&mut self, frames: Vec<NewCanFrame>, origin: FrameOrigin) -> bool {
         if frames.is_empty() {
-            return;
+            return false;
         }
         if self.document.is_none() {
             self.document = Some(TraceDocument {
                 path: PathBuf::from("Untitled messages"),
-                trace: TraceLog {
-                    start_time: None,
-                    messages: Vec::new(),
-                    skipped_message_lines: 0,
-                },
-                analyses: Vec::new(),
-                origins: Vec::new(),
+                frames: Vec::new(),
+                skipped_message_lines: 0,
                 stats: TraceStats::default(),
             });
         }
 
         let document = self.document.as_mut().expect("document was initialized");
         let mut next_number = document
-            .trace
-            .messages
+            .frames
             .iter()
-            .map(|message| message.number)
+            .map(|frame| frame.message.number)
             .max()
             .unwrap_or(0)
             .saturating_add(1);
-        let first_inserted = document.trace.messages.len();
+        let first_inserted = document.frames.len();
         for frame in frames {
-            document
-                .trace
-                .messages
-                .push(frame.into_trace_message(next_number));
-            document.origins.push(origin);
+            document.frames.push(AnalyzedFrame {
+                message: frame.into_trace_message(next_number),
+                analysis: None,
+                origin,
+                search_text: String::new(),
+            });
             next_number = next_number.saturating_add(1);
         }
-        document.analyses = decode_trace_ordered(&document.trace.messages);
-        document.stats = TraceStats::from_trace(&document.trace, &document.analyses);
+        document.reanalyze();
         self.selected_index = Some(first_inserted);
         self.refresh_visible_indices();
+        self.visible_indices.contains(&first_inserted)
     }
+}
+
+fn analyze_frames(messages: Vec<TraceMessage>, origins: Vec<FrameOrigin>) -> Vec<AnalyzedFrame> {
+    assert_eq!(
+        messages.len(),
+        origins.len(),
+        "every trace message must have exactly one origin"
+    );
+    let analyses = decode_trace_ordered(&messages);
+    messages
+        .into_iter()
+        .zip(analyses)
+        .zip(origins)
+        .map(|((message, analysis), origin)| {
+            let search_text = build_search_text(&message, analysis.as_ref());
+            AnalyzedFrame {
+                message,
+                analysis,
+                origin,
+                search_text,
+            }
+        })
+        .collect()
 }
 
 fn direction_matches(message: &TraceMessage, filter: DirectionFilter) -> bool {
@@ -549,30 +622,26 @@ fn scope_matches(
     }
 }
 
-fn query_matches(message: &TraceMessage, analysis: Option<&FrameAnalysis>, query: &str) -> bool {
-    if query.is_empty() {
-        return true;
+fn build_search_text(message: &TraceMessage, analysis: Option<&FrameAnalysis>) -> String {
+    let mut text = format!(
+        "{:03X}\n{}\n{}\n{}\n{}",
+        message.identifier,
+        message.number,
+        message.bus,
+        message.direction.to_ascii_uppercase(),
+        message.data_hex()
+    );
+    if let Some(analysis) = analysis {
+        text.push('\n');
+        text.push_str(&analysis.title.to_ascii_uppercase());
+        for field in &analysis.fields {
+            text.push('\n');
+            text.push_str(&field.name.to_ascii_uppercase());
+            text.push('\n');
+            text.push_str(&field.value.to_ascii_uppercase());
+        }
     }
-
-    let id_hex = format!("{:03X}", message.identifier);
-    let number = message.number.to_string();
-    let bus = message.bus.to_string();
-    if id_hex.contains(query)
-        || number.contains(query)
-        || bus.contains(query)
-        || message.direction.to_ascii_uppercase().contains(query)
-        || message.data_hex().contains(query)
-    {
-        return true;
-    }
-
-    analysis.is_some_and(|analysis| {
-        analysis.title.to_ascii_uppercase().contains(query)
-            || analysis.fields.iter().any(|field| {
-                field.name.to_ascii_uppercase().contains(query)
-                    || field.value.to_ascii_uppercase().contains(query)
-            })
-    })
+    text
 }
 
 #[cfg(test)]
@@ -608,8 +677,9 @@ mod tests {
             decoded[1].as_ref(),
             FrameScope::Explicit
         ));
-        assert!(query_matches(&explicit, None, "40E"));
-        assert!(query_matches(&explicit, None, "00 4B"));
+        let search_text = build_search_text(&explicit, decoded[0].as_ref());
+        assert!(search_text.contains("40E"));
+        assert!(search_text.contains("00 4B"));
     }
 
     #[test]
@@ -619,28 +689,25 @@ mod tests {
             message.time_offset_ms = Some(8.0);
             message
         }];
-        let trace = TraceLog {
-            start_time: None,
-            skipped_message_lines: 0,
-            messages,
-        };
-        let analyses = decode_trace_ordered(&trace.messages);
-        let stats = TraceStats::from_trace(&trace, &analyses);
+        let frames = analyze_frames(messages, vec![FrameOrigin::File; 2]);
+        let stats = TraceStats::from_frames(&frames);
         let mut app = AnalyzerApp {
             document: Some(TraceDocument {
                 path: "duplicate-numbers.log".into(),
-                trace,
-                analyses,
-                origins: vec![FrameOrigin::File; 2],
+                frames,
+                skipped_message_lines: 0,
                 stats,
             }),
             selected_index: Some(0),
             visible_indices: Vec::new(),
+            rendered_row_range: 0..0,
+            scroll_to_position: None,
             filters: MessageFilters::default(),
             sort_order: SortOrder::Ascending,
             load_error: None,
             operation_message: None,
             show_input_window: false,
+            input_needs_focus: false,
             input_tab: InputTab::Manual,
             manual_input: ManualInputForm::default(),
             ai_input: AiInputForm::default(),
@@ -653,7 +720,9 @@ mod tests {
         assert_eq!(app.visible_indices, vec![1, 0]);
         assert_eq!(app.selected_index, Some(0));
 
-        app.document.as_mut().unwrap().trace.messages[0].time_offset_ms = None;
+        app.document.as_mut().unwrap().frames[0]
+            .message
+            .time_offset_ms = None;
         app.sort_order = SortOrder::Ascending;
         app.refresh_visible_indices();
         assert_eq!(app.visible_indices, vec![1, 0]);
@@ -669,13 +738,13 @@ mod tests {
         early.time_offset_ms = Some(2.0);
         let mut missing = message(3, 0x400, "Tx", &[]);
         missing.time_offset_ms = None;
-        let trace = TraceLog {
-            start_time: None,
-            skipped_message_lines: 0,
-            messages: vec![late, early, missing],
-        };
-        let analyses = decode_trace_ordered(&trace.messages);
+        let frames = analyze_frames(
+            vec![late, early, missing],
+            vec![FrameOrigin::File, FrameOrigin::Manual, FrameOrigin::Ai],
+        );
+        let stats = TraceStats::from_frames(&frames);
 
-        assert_eq!(TraceStats::from_trace(&trace, &analyses).duration_ms, 8.0);
+        assert_eq!(stats.duration_ms, 8.0);
+        assert_eq!(stats.user_created, 2);
     }
 }

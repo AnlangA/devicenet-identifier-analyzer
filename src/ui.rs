@@ -13,13 +13,13 @@ use eframe::egui::{
 };
 use rfd::FileDialog;
 
-const MESSAGE_TABLE_WIDTH: f32 = 735.0;
-const MESSAGE_ROW_HEIGHT: f32 = 25.0;
+const MESSAGE_TABLE_WIDTH: f32 = 640.0;
+const MESSAGE_ROW_HEIGHT: f32 = 28.0;
 const AI_INPUT_HEIGHT: f32 = 150.0;
 
 impl eframe::App for AnalyzerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.poll_ai_job(ui.ctx());
+        self.poll_ai_job();
         if let Some(path) = ui.ctx().input(|input| {
             input
                 .raw
@@ -32,8 +32,9 @@ impl eframe::App for AnalyzerApp {
 
         handle_keyboard_navigation(ui, self);
 
+        let compact_header = ui.available_width() < 1050.0;
         egui::Panel::top("application_header")
-            .exact_size(80.0)
+            .exact_size(if compact_header { 116.0 } else { 80.0 })
             .frame(
                 egui::Frame::new()
                     .fill(BG)
@@ -42,11 +43,11 @@ impl eframe::App for AnalyzerApp {
             )
             .show(ui, |ui| header(ui, self));
 
-        let browser_max_width = (ui.available_width() - 430.0).clamp(470.0, 820.0);
+        let browser_max_width = (ui.available_width() - 430.0).clamp(500.0, 850.0);
         egui::Panel::left("message_browser")
             .resizable(true)
-            .default_size(620.0)
-            .size_range(470.0..=browser_max_width)
+            .default_size(680.0)
+            .size_range(500.0..=browser_max_width)
             .frame(
                 egui::Frame::new()
                     .fill(PANEL)
@@ -85,86 +86,118 @@ fn handle_keyboard_navigation(ui: &egui::Ui, app: &mut AnalyzerApp) {
 }
 
 fn header(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
-    ui.horizontal(|ui| {
-        ui.vertical(|ui| {
-            ui.label(
-                RichText::new("DeviceNet Trace Analyzer")
-                    .size(24.0)
-                    .color(TEXT)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new("Message Groups 1-4 | PCAN trace diagnostics")
-                    .size(11.0)
-                    .color(MUTED),
-            );
+    let compact = ui.available_width() < 1050.0;
+    if compact {
+        ui.horizontal(|ui| {
+            header_title(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                header_file(ui, app);
+            });
         });
-
+        ui.add_space(4.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let open = egui::Button::new(RichText::new("Open trace...").strong())
-                .fill(ACCENT)
-                .corner_radius(7.0)
-                .min_size(Vec2::new(126.0, 36.0));
-            if ui
-                .push_id("open_trace_control", |ui| ui.add(open))
-                .inner
-                .on_hover_text("Open .log, .trc, or .txt")
-                .clicked()
-                && let Some(path) = FileDialog::new()
-                    .add_filter("PCAN trace", &["log", "trc"])
-                    .add_filter("Text file", &["txt"])
-                    .pick_file()
-            {
-                app.load_file(path);
-            }
-
-            ui.add_space(6.0);
-            if ui
-                .push_id("add_messages_control", |ui| {
-                    ui.add(
-                        egui::Button::new("Add messages")
-                            .fill(PANEL_SOFT)
-                            .corner_radius(7.0)
-                            .min_size(Vec2::new(112.0, 36.0)),
-                    )
-                })
-                .inner
-                .on_hover_text("Insert CAN frames manually or with GLM-5-Turbo")
-                .clicked()
-            {
-                app.show_input_window = true;
-            }
-
-            ui.add_space(6.0);
-            let user_count = app.user_created_count();
-            if ui
-                .push_id("save_entered_messages_control", |ui| {
-                    ui.add_enabled(
-                        user_count > 0,
-                        egui::Button::new(format!("Save entered ({user_count})"))
-                            .fill(PANEL_SOFT)
-                            .corner_radius(7.0)
-                            .min_size(Vec2::new(132.0, 36.0)),
-                    )
-                })
-                .inner
-                .on_hover_text("Save manual and AI-created messages as a .log file")
-                .clicked()
-                && let Some(path) = FileDialog::new()
-                    .add_filter("DeviceNet log", &["log"])
-                    .set_file_name("devicenet-user-messages.log")
-                    .save_file()
-            {
-                app.save_user_frames(path);
-            }
-
-            if let Some(document) = &app.document {
-                ui.add_space(8.0);
-                let file = ui.label(RichText::new(document.file_name()).size(11.0).color(MUTED));
-                file.on_hover_text(document.path.display().to_string());
-            }
+            header_actions(ui, app, false);
         });
+    } else {
+        ui.horizontal(|ui| {
+            header_title(ui);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                header_actions(ui, app, true);
+            });
+        });
+    }
+}
+
+fn header_title(ui: &mut egui::Ui) {
+    ui.vertical(|ui| {
+        ui.label(
+            RichText::new("DeviceNet Trace Analyzer")
+                .size(24.0)
+                .color(TEXT)
+                .strong(),
+        );
+        ui.label(
+            RichText::new("Message Groups 1-4 | PCAN trace diagnostics")
+                .size(11.0)
+                .color(MUTED),
+        );
     });
+}
+
+fn header_actions(ui: &mut egui::Ui, app: &mut AnalyzerApp, include_file: bool) {
+    let open = egui::Button::new(RichText::new("Open trace...").strong())
+        .fill(ACCENT)
+        .corner_radius(7.0)
+        .min_size(Vec2::new(126.0, 36.0));
+    if ui
+        .push_id("open_trace_control", |ui| ui.add(open))
+        .inner
+        .on_hover_text("Open .log, .trc, or .txt")
+        .clicked()
+        && let Some(path) = FileDialog::new()
+            .add_filter("PCAN trace", &["log", "trc"])
+            .add_filter("Text file", &["txt"])
+            .pick_file()
+    {
+        app.load_file(path);
+    }
+
+    ui.add_space(6.0);
+    if ui
+        .push_id("add_messages_control", |ui| {
+            ui.add(
+                egui::Button::new("Add messages")
+                    .fill(PANEL_SOFT)
+                    .corner_radius(7.0)
+                    .min_size(Vec2::new(112.0, 36.0)),
+            )
+        })
+        .inner
+        .on_hover_text("Insert CAN frames manually or with GLM-5-Turbo")
+        .clicked()
+    {
+        app.show_input_window = true;
+        app.input_needs_focus = true;
+    }
+
+    ui.add_space(6.0);
+    let user_count = app.user_created_count();
+    if ui
+        .push_id("save_entered_messages_control", |ui| {
+            ui.add_enabled(
+                user_count > 0,
+                egui::Button::new(format!("Save entered ({user_count})"))
+                    .fill(PANEL_SOFT)
+                    .corner_radius(7.0)
+                    .min_size(Vec2::new(132.0, 36.0)),
+            )
+        })
+        .inner
+        .on_hover_text("Save manual and AI-created messages as a .log file")
+        .clicked()
+        && let Some(path) = FileDialog::new()
+            .add_filter("DeviceNet log", &["log"])
+            .set_file_name("devicenet-user-messages.log")
+            .save_file()
+    {
+        app.save_user_frames(path);
+    }
+
+    if include_file {
+        ui.add_space(8.0);
+        header_file(ui, app);
+    }
+}
+
+fn header_file(ui: &mut egui::Ui, app: &AnalyzerApp) {
+    if let Some(document) = &app.document {
+        let file = ui.add_sized(
+            [180.0, 20.0],
+            egui::Label::new(RichText::new(document.file_name()).size(11.0).color(MUTED))
+                .truncate(),
+        );
+        file.on_hover_text(document.path.display().to_string());
+    }
 }
 
 fn message_input_window(ctx: &egui::Context, app: &mut AnalyzerApp) {
@@ -191,12 +224,18 @@ fn message_input_window(ctx: &egui::Context, app: &mut AnalyzerApp) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
-                        ui.selectable_value(&mut app.input_tab, InputTab::Manual, "Manual entry");
-                        ui.selectable_value(
-                            &mut app.input_tab,
-                            InputTab::Ai,
-                            "AI structured entry",
-                        );
+                        let changed = ui
+                            .selectable_value(&mut app.input_tab, InputTab::Manual, "Manual entry")
+                            .changed()
+                            | ui.selectable_value(
+                                &mut app.input_tab,
+                                InputTab::Ai,
+                                "AI structured entry",
+                            )
+                            .changed();
+                        if changed {
+                            app.input_needs_focus = true;
+                        }
                     });
                     ui.separator();
                     ui.add_space(5.0);
@@ -232,17 +271,23 @@ fn manual_input_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
         .spacing([12.0, 9.0])
         .show(ui, |ui| {
             ui.label(RichText::new("Time (ms)").color(MUTED));
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut app.manual_input.time_ms)
                     .id(ui.make_persistent_id("manual_time_ms_input"))
+                    .desired_width(430.0)
                     .hint_text("Optional; leave empty"),
             );
+            if app.input_needs_focus {
+                response.request_focus();
+                app.input_needs_focus = false;
+            }
             ui.end_row();
 
             ui.label(RichText::new("CAN ID").color(MUTED));
             ui.add(
                 egui::TextEdit::singleline(&mut app.manual_input.can_id)
                     .id(ui.make_persistent_id("manual_can_id_input"))
+                    .desired_width(430.0)
                     .hint_text("Example: 0x40E or 1038"),
             );
             ui.end_row();
@@ -251,6 +296,7 @@ fn manual_input_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
             ui.add(
                 egui::TextEdit::singleline(&mut app.manual_input.can_data)
                     .id(ui.make_persistent_id("manual_can_data_input"))
+                    .desired_width(430.0)
                     .hint_text("Example: 00 4B 03 01 01 00"),
             );
             ui.end_row();
@@ -294,7 +340,6 @@ fn ai_input_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
                 .strong(),
         );
         chip(ui, "glm-5-turbo", PURPLE);
-        chip(ui, "zai-rs 0.6.0", BLUE);
         chip(ui, "Function Calling", ACCENT);
     });
     ui.label(
@@ -312,12 +357,17 @@ fn ai_input_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
         .spacing([12.0, 9.0])
         .show(ui, |ui| {
             ui.label(RichText::new("API Key").color(MUTED));
-            ui.add(
+            let response = ui.add(
                 egui::TextEdit::singleline(&mut app.ai_input.api_key)
                     .id(ui.make_persistent_id("zai_api_key_input"))
+                    .desired_width(430.0)
                     .password(true)
                     .hint_text("Required; kept in memory only"),
             );
+            if app.input_needs_focus {
+                response.request_focus();
+                app.input_needs_focus = false;
+            }
             ui.end_row();
 
             ui.label(RichText::new("API endpoint").color(MUTED));
@@ -457,7 +507,7 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
             let count = app
                 .document
                 .as_ref()
-                .map_or(0, |document| document.trace.messages.len());
+                .map_or(0, |document| document.frames.len());
             ui.label(
                 RichText::new(format!(
                     "{} shown | {count} total",
@@ -508,16 +558,15 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
             metric(ui, "G2", document.stats.group2, BLUE);
             metric(ui, "G3", document.stats.group3, AMBER);
             metric(ui, "G4", document.stats.group4, PURPLE);
-            let entered = document
-                .origins
-                .iter()
-                .filter(|origin| origin.is_user_created())
-                .count();
+            let entered = document.stats.user_created;
             if entered > 0 {
                 metric(ui, "ENTERED", entered, ACCENT);
             }
             if document.stats.warnings > 0 {
                 metric(ui, "WARN", document.stats.warnings, AMBER);
+            }
+            if document.skipped_message_lines > 0 {
+                metric(ui, "SKIPPED", document.skipped_message_lines, AMBER);
             }
             ui.label(
                 RichText::new(format!("{:.1} ms", document.stats.duration_ms))
@@ -526,6 +575,17 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
                     .monospace(),
             );
         });
+        if document.skipped_message_lines > 0 {
+            ui.add_space(6.0);
+            alert(
+                ui,
+                &format!(
+                    "{} message-like line(s) were invalid and skipped while loading",
+                    document.skipped_message_lines
+                ),
+                AMBER,
+            );
+        }
     }
 
     ui.add_space(10.0);
@@ -533,9 +593,6 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
         app.refresh_visible_indices();
     }
     ui.add_space(8.0);
-
-    table_header(ui);
-    ui.add_space(2.0);
 
     let Some(document) = &app.document else {
         empty_state(
@@ -557,35 +614,55 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
 
     let visible_indices = &app.visible_indices;
     let selected_index = app.selected_index;
+    let scroll_to_position = app.scroll_to_position.take();
+    let table_width = MESSAGE_TABLE_WIDTH.max(ui.available_width());
+    let viewport_height = ui.available_height();
     let mut clicked_index = None;
-    egui::ScrollArea::both()
-        .id_salt("message_table_scroll")
+    let mut rendered_row_range = 0..0;
+    egui::ScrollArea::horizontal()
+        .id_salt("message_table_horizontal_scroll")
         .auto_shrink([false, false])
-        .show_rows(
-            ui,
-            MESSAGE_ROW_HEIGHT,
-            visible_indices.len(),
-            |ui, row_range| {
-                ui.set_min_width(MESSAGE_TABLE_WIDTH);
-                for row in row_range {
-                    let source_index = visible_indices[row];
-                    let message = &document.trace.messages[source_index];
-                    if ui
-                        .push_id(("message_row_position", row), |ui| {
-                            message_row(
-                                ui,
-                                message,
-                                document.origins[source_index],
-                                selected_index == Some(source_index),
-                            )
-                        })
-                        .inner
-                    {
-                        clicked_index = Some(source_index);
+        .show(ui, |ui| {
+            ui.set_min_width(table_width);
+            table_header(ui, table_width);
+            ui.add_space(2.0);
+            let mut rows = egui::ScrollArea::vertical()
+                .id_salt("message_table_vertical_scroll")
+                .auto_shrink([false, false]);
+            if let Some(position) = scroll_to_position {
+                let centered_offset = position as f32 * MESSAGE_ROW_HEIGHT
+                    - (viewport_height - MESSAGE_ROW_HEIGHT) * 0.5;
+                rows = rows.vertical_scroll_offset(centered_offset.max(0.0));
+            }
+            rows.show_rows(
+                ui,
+                MESSAGE_ROW_HEIGHT,
+                visible_indices.len(),
+                |ui, row_range| {
+                    rendered_row_range = row_range.clone();
+                    for row in row_range {
+                        let source_index = visible_indices[row];
+                        let frame = &document.frames[source_index];
+                        if ui
+                            .push_id(("message_row_position", row), |ui| {
+                                message_row(
+                                    ui,
+                                    &frame.message,
+                                    frame.origin,
+                                    selected_index == Some(source_index),
+                                    row,
+                                    table_width,
+                                )
+                            })
+                            .inner
+                        {
+                            clicked_index = Some(source_index);
+                        }
                     }
-                }
-            },
-        );
+                },
+            );
+        });
+    app.rendered_row_range = rendered_row_range;
     if let Some(index) = clicked_index {
         app.selected_index = Some(index);
     }
@@ -643,16 +720,13 @@ fn filter_bar(ui: &mut egui::Ui, filters: &mut MessageFilters) -> bool {
     changed
 }
 
-fn table_header(ui: &mut egui::Ui) {
+fn table_header(ui: &mut egui::Ui, width: f32) {
     egui::Frame::new()
         .fill(SURFACE)
         .corner_radius(5.0)
         .inner_margin(egui::Margin::symmetric(0, 2))
         .show(ui, |ui| {
-            let (rect, _) = ui.allocate_exact_size(
-                Vec2::new(ui.available_width().max(370.0), 24.0),
-                Sense::hover(),
-            );
+            let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
             paint_message_columns(ui, rect, None, None, MUTED);
         });
 }
@@ -662,11 +736,30 @@ fn message_row(
     message: &TraceMessage,
     origin: FrameOrigin,
     selected: bool,
+    row: usize,
+    width: f32,
 ) -> bool {
-    let width = MESSAGE_TABLE_WIDTH.max(ui.available_width());
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(width, MESSAGE_ROW_HEIGHT), Sense::click());
     let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            true,
+            selected,
+            format!(
+                "Frame {}, ID {:03X}, {}, data {}",
+                message.number,
+                message.identifier,
+                message.direction,
+                message.data_hex()
+            ),
+        )
+    });
+    if row % 2 == 1 {
+        ui.painter()
+            .rect_filled(rect.shrink(1.0), 4.0, PANEL_SOFT.gamma_multiply(0.5));
+    }
     if selected {
         ui.painter()
             .rect_filled(rect.shrink(1.0), 4.0, ACCENT.gamma_multiply(0.18));
@@ -679,6 +772,14 @@ fn message_row(
     } else if response.hovered() {
         ui.painter().rect_filled(rect.shrink(1.0), 4.0, PANEL_SOFT);
     }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.shrink(2.0),
+            4.0,
+            Stroke::new(1.0, BLUE),
+            egui::StrokeKind::Inside,
+        );
+    }
 
     let direction_color = if message.direction.eq_ignore_ascii_case("Tx") {
         ACCENT
@@ -688,6 +789,7 @@ fn message_row(
     paint_message_columns(ui, rect, Some(message), Some(origin), direction_color);
     let clicked = response.clicked();
     if clicked {
+        response.request_focus();
         response.ctx.request_repaint();
     }
     clicked
@@ -700,7 +802,7 @@ fn paint_message_columns(
     origin: Option<FrameOrigin>,
     direction_color: Color32,
 ) {
-    let mono = FontId::new(11.5, FontFamily::Monospace);
+    let mono = FontId::new(12.0, FontFamily::Monospace);
     let y = rect.center().y;
     let x = rect.left();
     let painter = ui.painter();
@@ -729,59 +831,59 @@ fn paint_message_columns(
     };
     let normal = if message.is_some() { TEXT } else { MUTED };
     painter.text(
-        Pos2::new(x + 44.0, y),
+        Pos2::new(x + 42.0, y),
         Align2::RIGHT_CENTER,
         number,
         mono.clone(),
         normal,
     );
     painter.text(
-        Pos2::new(x + 142.0, y),
+        Pos2::new(x + 128.0, y),
         Align2::RIGHT_CENTER,
         time,
         mono.clone(),
         normal,
     );
     painter.text(
-        Pos2::new(x + 190.0, y),
+        Pos2::new(x + 166.0, y),
         Align2::RIGHT_CENTER,
         bus,
         mono.clone(),
         normal,
     );
     painter.text(
-        Pos2::new(x + 235.0, y),
+        Pos2::new(x + 205.0, y),
         Align2::RIGHT_CENTER,
         direction,
         mono.clone(),
         direction_color,
     );
     painter.text(
-        Pos2::new(x + 300.0, y),
+        Pos2::new(x + 252.0, y),
         Align2::RIGHT_CENTER,
         identifier,
         mono.clone(),
         if message.is_some() { BLUE } else { MUTED },
     );
     painter.text(
-        Pos2::new(x + 347.0, y),
+        Pos2::new(x + 290.0, y),
         Align2::RIGHT_CENTER,
         dlc,
         mono.clone(),
         normal,
     );
     painter.text(
-        Pos2::new(x + 370.0, y),
+        Pos2::new(x + 310.0, y),
         Align2::LEFT_CENTER,
         data,
         mono,
         normal,
     );
     painter.text(
-        Pos2::new(x + 660.0, y),
+        Pos2::new(x + 555.0, y),
         Align2::LEFT_CENTER,
         origin.map_or("Source", FrameOrigin::label),
-        FontId::new(10.0, FontFamily::Monospace),
+        FontId::new(11.0, FontFamily::Monospace),
         match origin {
             Some(FrameOrigin::Manual) => ACCENT,
             Some(FrameOrigin::Ai) => PURPLE,
@@ -806,9 +908,10 @@ fn selected_message_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
     let Some(document) = &app.document else {
         return;
     };
-    let message = &document.trace.messages[source_index];
-    let analysis = document.analyses[source_index].as_ref();
-    let origin = document.origins[source_index];
+    let frame = &document.frames[source_index];
+    let message = &frame.message;
+    let analysis = frame.analysis.as_ref();
+    let origin = frame.origin;
 
     egui::ScrollArea::vertical()
         .id_salt("message_details_scroll")
@@ -836,6 +939,7 @@ fn selected_message_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
 }
 
 fn details_toolbar(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
+    let selected_position = app.selected_position();
     ui.horizontal(|ui| {
         ui.label(
             RichText::new("Message inspector")
@@ -844,9 +948,8 @@ fn details_toolbar(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
                 .strong(),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let can_next = app
-                .selected_position()
-                .is_some_and(|position| position + 1 < app.visible_indices.len());
+            let can_next =
+                selected_position.is_some_and(|position| position + 1 < app.visible_indices.len());
             if ui
                 .push_id("next_message_control", |ui| {
                     ui.add_enabled(can_next, egui::Button::new("Next"))
@@ -856,7 +959,7 @@ fn details_toolbar(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
             {
                 app.select_relative(1);
             }
-            let can_previous = app.selected_position().is_some_and(|position| position > 0);
+            let can_previous = selected_position.is_some_and(|position| position > 0);
             if ui
                 .push_id("previous_message_control", |ui| {
                     ui.add_enabled(can_previous, egui::Button::new("Previous"))
@@ -866,7 +969,7 @@ fn details_toolbar(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
             {
                 app.select_relative(-1);
             }
-            if let Some(position) = app.selected_position() {
+            if let Some(position) = selected_position {
                 ui.add_sized(
                     [76.0, 28.0],
                     egui::Label::new(
@@ -946,7 +1049,7 @@ fn data_decoder_panel(
         .inner_margin(10.0)
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.label(RichText::new("RAW").size(9.0).color(MUTED).strong());
+                ui.label(RichText::new("RAW").size(10.5).color(MUTED).strong());
                 ui.label(
                     RichText::new(&raw)
                         .size(13.0)
@@ -1000,9 +1103,9 @@ fn data_decoder_panel(
                 .striped(true)
                 .show(ui, |ui| {
                     for field in &analysis.fields {
-                        let service_code = service_code_from_field(&field.name, &field.value);
+                        let service_code = field.service_code;
                         let name_response = ui.add(
-                            egui::Label::new(RichText::new(&field.name).size(10.0).color(MUTED))
+                            egui::Label::new(RichText::new(&field.name).size(11.0).color(MUTED))
                                 .wrap(),
                         );
                         let display_value = if service_code.is_some() {
@@ -1013,7 +1116,7 @@ fn data_decoder_panel(
                         let value_response = ui.add(
                             egui::Label::new(
                                 RichText::new(display_value)
-                                    .size(11.0)
+                                    .size(12.0)
                                     .color(TEXT)
                                     .monospace(),
                             )
@@ -1034,14 +1137,6 @@ fn data_decoder_panel(
             alert(ui, &format!("Warning: {warning}"), AMBER);
         }
     }
-}
-
-fn service_code_from_field(name: &str, value: &str) -> Option<u8> {
-    if !matches!(name, "Service" | "Request service") {
-        return None;
-    }
-    let code = value.split_whitespace().next()?.strip_prefix("0x")?;
-    u8::from_str_radix(code, 16).ok()
 }
 
 fn humanize_service_text(value: &str) -> String {
@@ -1189,7 +1284,7 @@ fn bit_chip(ui: &mut egui::Ui, label: &str, bits: &str, color: Color32) {
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(label).size(9.0).color(MUTED));
+                ui.label(RichText::new(label).size(10.5).color(MUTED));
                 ui.label(
                     RichText::new(bits)
                         .size(12.0)
@@ -1209,7 +1304,7 @@ fn metric(ui: &mut egui::Ui, label: &str, value: usize, color: Color32) {
         .show(ui, |ui| {
             ui.label(
                 RichText::new(format!("{label} {value}"))
-                    .size(9.0)
+                    .size(10.0)
                     .color(color)
                     .strong(),
             );
@@ -1222,7 +1317,7 @@ fn chip(ui: &mut egui::Ui, label: &str, color: Color32) {
         .corner_radius(5.0)
         .inner_margin(egui::Margin::symmetric(7, 3))
         .show(ui, |ui| {
-            ui.label(RichText::new(label).size(9.5).color(color).strong());
+            ui.label(RichText::new(label).size(10.5).color(color).strong());
         });
 }
 
@@ -1246,7 +1341,7 @@ fn alert(ui: &mut egui::Ui, text: &str, color: Color32) {
         .inner_margin(egui::Margin::symmetric(9, 7))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(text).size(10.5).color(color)).wrap());
+            ui.add(egui::Label::new(RichText::new(text).size(11.5).color(color)).wrap());
         });
 }
 
@@ -1260,7 +1355,7 @@ fn empty_state(ui: &mut egui::Ui, title: &str, description: &str) {
 }
 
 fn section_label(ui: &mut egui::Ui, label: &str) {
-    ui.label(RichText::new(label).size(9.5).color(MUTED).strong());
+    ui.label(RichText::new(label).size(10.5).color(MUTED).strong());
 }
 
 fn analysis_color(analysis: &FrameAnalysis) -> Color32 {
@@ -1276,6 +1371,10 @@ fn analysis_color(analysis: &FrameAnalysis) -> Color32 {
         FrameFunction::Group2(Group2Function::DuplicateMacIdCheck)
         | FrameFunction::Group3Invalid => AMBER,
         FrameFunction::Group1Connection => ACCENT,
+        FrameFunction::Group1IoMulticastPollResponse
+        | FrameFunction::Group1IoChangeOfStateOrCyclic
+        | FrameFunction::Group1IoBitStrobeResponse
+        | FrameFunction::Group1IoPollResponseOrChangeOfStateAck => PURPLE,
         FrameFunction::Group3Connection => AMBER,
         FrameFunction::Group4Reserved
         | FrameFunction::Group4CommunicationFaultedResponse

@@ -72,15 +72,16 @@ impl NewCanFrame {
     }
 
     pub(crate) fn into_trace_message(self, number: u64) -> TraceMessage {
-        TraceMessage {
+        TraceMessage::try_new(
             number,
-            time_offset_ms: self.time_ms,
-            bus: 1,
-            direction: "Tx".into(),
-            identifier: self.can_id,
-            dlc: self.can_dlc,
-            data: self.can_data,
-        }
+            self.time_ms,
+            1,
+            "Tx",
+            self.can_id,
+            self.can_dlc,
+            self.can_data,
+        )
+        .expect("NewCanFrame is validated before conversion")
     }
 }
 

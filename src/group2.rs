@@ -1,5 +1,8 @@
+use crate::explicit::{ExplicitHeader, FragmentKind, MessageBodyFormat, fragment_ack_status};
+use crate::path::decode_logical_path;
 use crate::services::{decode_common_service_data, service_name};
-use crate::{TraceMessage, compare_optional_time};
+use crate::status::general_status_name;
+use crate::{DecodedField, TraceMessage, compare_optional_time};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,63 +20,16 @@ pub enum Group2Function {
 impl Group2Function {
     pub fn label(self) -> &'static str {
         match self {
-            Self::IoBitStrobeCommand => "I/O Bit-Strobe Command",
-            Self::IoMulticastPollCommand => "I/O Multicast Poll Command",
-            Self::ChangeOfStateOrCyclicAck => "COS/Cyclic Acknowledge",
-            Self::ExplicitOrUnconnectedResponse => "Explicit/Unconnected Response",
-            Self::ExplicitRequest => "Explicit Request",
-            Self::IoPollOrChangeOfStateOrCyclic => "I/O Poll/COS/Cyclic",
+            Self::IoBitStrobeCommand => "Controller I/O Bit-Strobe Command",
+            Self::IoMulticastPollCommand => "Controller I/O Multicast Poll Command",
+            Self::ChangeOfStateOrCyclicAck => "Controller Change of State/Cyclic Acknowledge",
+            Self::ExplicitOrUnconnectedResponse => "Device Explicit/Unconnected Response",
+            Self::ExplicitRequest => "Controller Explicit Request",
+            Self::IoPollOrChangeOfStateOrCyclic => {
+                "Controller I/O Poll Command or Change of State/Cyclic Message"
+            }
             Self::UnconnectedExplicitRequest => "Group 2 Only Unconnected Request",
             Self::DuplicateMacIdCheck => "Duplicate MAC ID Check",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageBodyFormat {
-    DeviceNet8_8,
-    DeviceNet8_16,
-    DeviceNet16_16,
-    DeviceNet16_8,
-    CipPath,
-    Reserved(u8),
-}
-
-impl MessageBodyFormat {
-    pub(crate) fn from_value(value: u8) -> Self {
-        match value {
-            0 => Self::DeviceNet8_8,
-            1 => Self::DeviceNet8_16,
-            2 => Self::DeviceNet16_16,
-            3 => Self::DeviceNet16_8,
-            4 => Self::CipPath,
-            value => Self::Reserved(value),
-        }
-    }
-
-    pub fn label(self) -> String {
-        match self {
-            Self::DeviceNet8_8 => "DeviceNet 8/8".into(),
-            Self::DeviceNet8_16 => "DeviceNet 8/16".into(),
-            Self::DeviceNet16_16 => "DeviceNet 16/16".into(),
-            Self::DeviceNet16_8 => "DeviceNet 16/8".into(),
-            Self::CipPath => "CIP Path".into(),
-            Self::Reserved(value) => format!("Reserved ({value})"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodedField {
-    pub name: String,
-    pub value: String,
-}
-
-impl DecodedField {
-    fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            value: value.into(),
         }
     }
 }
@@ -100,6 +56,10 @@ impl Group2Analysis {
         self.fields.push(DecodedField::new(name, value));
     }
 
+    fn push_service(&mut self, name: impl Into<String>, code: u8, value: impl Into<String>) {
+        self.fields.push(DecodedField::service(name, code, value));
+    }
+
     pub fn field(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()
@@ -110,6 +70,7 @@ impl Group2Analysis {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct FragmentKey {
+    bus: u32,
     identifier: u32,
     header_without_frag: u8,
     direction: String,
@@ -118,6 +79,7 @@ struct FragmentKey {
 #[derive(Debug, Clone)]
 struct FragmentState {
     first_message: u64,
+    last_kind: FragmentKind,
     last_count: u8,
     fragments: usize,
     body: Vec<u8>,
@@ -125,6 +87,7 @@ struct FragmentState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct RequestKey {
+    bus: u32,
     device_mac: u8,
     client_mac: u8,
     xid: u8,
@@ -133,20 +96,39 @@ struct RequestKey {
 #[derive(Debug, Clone)]
 struct RequestContext {
     message_number: u64,
+    message_id: u8,
     service_code: u8,
     service_name: String,
     class_id: Option<u32>,
     instance_id: Option<u32>,
     attribute_id: Option<u32>,
+    kind: RequestKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestKind {
+    Generic,
+    AllocateControllerDevice,
+    ReleaseControllerDevice { choice: Option<u8> },
 }
 
 #[derive(Default)]
-struct Group2Decoder {
-    body_formats: HashMap<u8, MessageBodyFormat>,
+pub(crate) struct Group2Decoder {
+    body_formats: HashMap<(u32, u8), MessageBodyFormat>,
     fragments: HashMap<FragmentKey, FragmentState>,
     requests: HashMap<RequestKey, RequestContext>,
 }
 
+/// Decode only the predefined/static Group 2 interpretation into a frame-number map.
+///
+/// This compatibility API is lossy when display frame numbers repeat and does not
+/// have the UCMM context required to recognize dynamically allocated Group 2
+/// connections. Prefer [`decode_group2_trace_ordered`] for static Group 2 work,
+/// or the crate-level unified ordered decoder for complete traces.
+#[deprecated(
+    since = "0.1.0",
+    note = "use decode_group2_trace_ordered, or decode_trace_ordered for UCMM-aware decoding"
+)]
 pub fn decode_group2_trace(messages: &[TraceMessage]) -> HashMap<u64, Group2Analysis> {
     let mut ordered: Vec<_> = messages.iter().collect();
     ordered.sort_by(|left, right| {
@@ -186,7 +168,7 @@ pub fn decode_group2_trace_ordered(messages: &[TraceMessage]) -> Vec<Option<Grou
 }
 
 impl Group2Decoder {
-    fn decode(&mut self, message: &TraceMessage) -> Option<Group2Analysis> {
+    pub(crate) fn decode(&mut self, message: &TraceMessage) -> Option<Group2Analysis> {
         if !(0x400..=0x5ff).contains(&message.identifier) {
             return None;
         }
@@ -216,7 +198,7 @@ impl Group2Decoder {
         analysis.push("I/O data", hex_bytes(&message.data));
         analysis.push(
             "Interpretation",
-            "Application-specific I/O payload (not defined by DeviceNet)",
+            "Application-/connection-specific I/O payload (not defined by the identifier mapping)",
         );
         analysis
     }
@@ -229,6 +211,12 @@ impl Group2Decoder {
     ) -> Group2Analysis {
         let mut analysis = Group2Analysis::new(function, function.label());
         analysis.push("Destination MAC ID", format!("{mac_id}"));
+        if message.data.len() != 7 {
+            analysis.warnings.push(format!(
+                "Duplicate MAC ID Check must contain exactly 7 bytes, found {}",
+                message.data.len()
+            ));
+        }
         let Some(flags) = message.data.first().copied() else {
             analysis
                 .warnings
@@ -267,6 +255,9 @@ impl Group2Decoder {
                 .warnings
                 .push("Missing 32-bit Serial Number".into());
         }
+        if message.data.len() > 7 {
+            analysis.push("Trailing data", hex_bytes(&message.data[7..]));
+        }
         analysis
     }
 
@@ -285,20 +276,24 @@ impl Group2Decoder {
             return base;
         };
 
-        let fragmented = header & 0x80 != 0;
-        let xid = (header >> 6) & 0x01;
-        let peer_mac = header & 0x3f;
-        base.push("XID", format!("{xid}"));
+        let decoded_header = ExplicitHeader::decode(header);
+        base.push("XID", format!("{}", decoded_header.xid));
         base.push(
             if message_id == 3 {
                 "Destination MAC ID"
             } else {
                 "Source MAC ID"
             },
-            format!("{peer_mac}"),
+            format!("{}", decoded_header.peer_mac),
         );
 
-        if !fragmented {
+        if !decoded_header.fragmented {
+            self.fragments.remove(&FragmentKey {
+                bus: message.bus,
+                identifier: message.identifier,
+                header_without_frag: header & 0x7f,
+                direction: message.direction.to_ascii_lowercase(),
+            });
             return self.decode_explicit_body(
                 message,
                 function,
@@ -315,12 +310,11 @@ impl Group2Decoder {
                 .push("Missing Fragmentation Protocol byte".into());
             return base;
         };
-        let fragment_type = protocol >> 6;
-        let fragment_count = protocol & 0x3f;
-        base.push("Fragment type", fragment_type_name(fragment_type));
+        let (fragment_kind, fragment_count) = FragmentKind::decode(protocol);
+        base.push("Fragment type", fragment_kind.label());
         base.push("Fragment count", format!("{fragment_count}"));
 
-        if fragment_type == 3 {
+        if fragment_kind == FragmentKind::Acknowledge {
             base.title = "Explicit Fragment Acknowledge".into();
             if let Some(status) = message.data.get(2).copied() {
                 base.push("Ack status", fragment_ack_status(status));
@@ -332,14 +326,16 @@ impl Group2Decoder {
         }
 
         let key = FragmentKey {
+            bus: message.bus,
             identifier: message.identifier,
             header_without_frag: header & 0x7f,
             direction: message.direction.to_ascii_lowercase(),
         };
         let fragment_body = message.data.get(2..).unwrap_or_default();
 
-        match (fragment_type, fragment_count) {
-            (0, 0x3f) => {
+        match (fragment_kind, fragment_count) {
+            (FragmentKind::First, 0x3f) => {
+                self.fragments.remove(&key);
                 base.push("Reassembly", "Single-fragment complete message");
                 self.decode_explicit_body(
                     message,
@@ -351,11 +347,12 @@ impl Group2Decoder {
                     base,
                 )
             }
-            (0, 0) => {
+            (FragmentKind::First, 0) => {
                 self.fragments.insert(
                     key,
                     FragmentState {
                         first_message: message.number,
+                        last_kind: FragmentKind::First,
                         last_count: 0,
                         fragments: 1,
                         body: fragment_body.to_vec(),
@@ -365,20 +362,20 @@ impl Group2Decoder {
                 base.push("Fragment data", hex_bytes(fragment_body));
                 base
             }
-            (0, _) => {
+            (FragmentKind::First, _) => {
                 self.fragments.remove(&key);
                 base.warnings
                     .push("First fragment count must be 0 or 63; reassembly was reset".into());
                 base
             }
-            (1 | 2, _) => {
+            (FragmentKind::Middle | FragmentKind::Last, _) => {
                 let Some(state) = self.fragments.get_mut(&key) else {
                     base.warnings
                         .push("Fragment received before a first fragment".into());
                     return base;
                 };
                 let expected = (state.last_count + 1) & 0x3f;
-                if fragment_count == state.last_count {
+                if fragment_kind == state.last_kind && fragment_count == state.last_count {
                     base.title = "Repeated Explicit Message Fragment".into();
                     base.push("Reassembly", "Duplicate/retry ignored");
                     return base;
@@ -391,9 +388,10 @@ impl Group2Decoder {
                     return base;
                 }
                 state.body.extend_from_slice(fragment_body);
+                state.last_kind = fragment_kind;
                 state.last_count = fragment_count;
                 state.fragments += 1;
-                if fragment_type == 1 {
+                if fragment_kind == FragmentKind::Middle {
                     base.title = "Middle Explicit Message Fragment".into();
                     base.push("Reassembled bytes", format!("{}", state.body.len()));
                     return base;
@@ -416,10 +414,7 @@ impl Group2Decoder {
                 decoded.title.push_str(" (Reassembled)");
                 decoded
             }
-            _ => {
-                base.warnings.push("Reserved fragmentation type".into());
-                base
-            }
+            (FragmentKind::Acknowledge, _) => unreachable!("acknowledgments returned above"),
         }
     }
 
@@ -442,17 +437,34 @@ impl Group2Decoder {
         };
         let is_response = service_field & 0x80 != 0;
         let service_code = service_field & 0x7f;
-        let name = group2_service_name(service_code);
+        let name = if message_id == 6 && matches!(service_code, 0x4b | 0x4c) {
+            device_net_service_name(service_code)
+        } else {
+            service_name(service_code)
+        };
         analysis.title = format!(
             "{} {}",
             name,
             if is_response { "Response" } else { "Request" }
         );
-        analysis.push("Service", format!("0x{service_code:02X} - {name}"));
+        analysis.push_service(
+            "Service",
+            service_code,
+            format!("0x{service_code:02X} - {name}"),
+        );
         analysis.push("R/R", if is_response { "Response" } else { "Request" });
+        let state_valid = is_response == (message_id == 3);
 
         if message_id == 3 {
-            self.decode_response(message, device_mac, header, service_code, body, analysis)
+            self.decode_response(
+                message,
+                device_mac,
+                header,
+                service_code,
+                body,
+                analysis,
+                state_valid,
+            )
         } else {
             self.decode_request(
                 message,
@@ -463,6 +475,7 @@ impl Group2Decoder {
                 service_code,
                 body,
                 analysis,
+                state_valid,
             )
         }
     }
@@ -478,6 +491,7 @@ impl Group2Decoder {
         service_code: u8,
         body: &[u8],
         mut analysis: Group2Analysis,
+        state_valid: bool,
     ) -> Group2Analysis {
         if body[0] & 0x80 != 0 {
             analysis
@@ -488,7 +502,7 @@ impl Group2Decoder {
         let body_format = if message_id == 6 {
             Some(MessageBodyFormat::DeviceNet8_8)
         } else {
-            self.body_formats.get(&device_mac).copied()
+            self.body_formats.get(&(message.bus, device_mac)).copied()
         };
         if let Some(format) = body_format {
             analysis.push("Message body format", format.label());
@@ -503,7 +517,14 @@ impl Group2Decoder {
         let mut service_data = body.get(address.data_offset..).unwrap_or_default();
         let mut attribute_id = None;
 
-        if matches!(service_code, 0x0e | 0x10) && body_format != Some(MessageBodyFormat::CipPath) {
+        if matches!(service_code, 0x0e | 0x10)
+            && body_format.is_some_and(|format| {
+                !matches!(
+                    format,
+                    MessageBodyFormat::CipPath | MessageBodyFormat::Reserved(_)
+                )
+            })
+        {
             if let Some(attribute) = service_data.first().copied() {
                 attribute_id = Some(attribute as u32);
                 analysis.push("Attribute ID", format_u32(attribute as u32));
@@ -513,9 +534,41 @@ impl Group2Decoder {
             }
         }
 
-        match service_code {
-            0x4b => decode_allocation_request(service_data, &mut analysis),
-            0x4c => decode_release_request(service_data, &mut analysis),
+        let targets_devicenet_object =
+            address.class_id == Some(0x03) && address.instance_id == Some(0x01);
+        let request_kind = match (service_code, targets_devicenet_object) {
+            (0x4b, true) => RequestKind::AllocateControllerDevice,
+            (0x4c, true) => RequestKind::ReleaseControllerDevice {
+                choice: service_data.first().copied(),
+            },
+            _ => RequestKind::Generic,
+        };
+        if message_id == 6 && !targets_devicenet_object {
+            analysis.warnings.push(
+                "Group 2 Only connection management must target DeviceNet Object Class 0x03, Instance 1"
+                    .into(),
+            );
+        }
+
+        match request_kind {
+            RequestKind::AllocateControllerDevice => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    false,
+                );
+                decode_allocation_request(service_data, message_id == 6, &mut analysis);
+            }
+            RequestKind::ReleaseControllerDevice { .. } => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    false,
+                );
+                decode_release_request(service_data, &mut analysis);
+            }
             _ if body_format.is_some() => append_service_details(
                 &mut analysis,
                 decode_common_service_data(
@@ -537,33 +590,46 @@ impl Group2Decoder {
 
         let xid = (header >> 6) & 1;
         let client_mac = header & 0x3f;
-        self.requests.insert(
-            RequestKey {
-                device_mac,
-                client_mac,
-                xid,
-            },
-            RequestContext {
-                message_number: message.number,
-                service_code,
-                service_name: group2_service_name(service_code).into(),
-                class_id: address.class_id,
-                instance_id: address.instance_id,
-                attribute_id,
-            },
-        );
+        if state_valid {
+            self.requests.insert(
+                RequestKey {
+                    bus: message.bus,
+                    device_mac,
+                    client_mac,
+                    xid,
+                },
+                RequestContext {
+                    message_number: message.number,
+                    message_id,
+                    service_code,
+                    service_name: match request_kind {
+                        RequestKind::AllocateControllerDevice
+                        | RequestKind::ReleaseControllerDevice { .. } => {
+                            device_net_service_name(service_code).into()
+                        }
+                        RequestKind::Generic => service_name(service_code).into(),
+                    },
+                    class_id: address.class_id,
+                    instance_id: address.instance_id,
+                    attribute_id,
+                    kind: request_kind,
+                },
+            );
+        }
         analysis.function = function;
         analysis
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn decode_response(
         &mut self,
-        _message: &TraceMessage,
+        message: &TraceMessage,
         device_mac: u8,
         header: u8,
         service_code: u8,
         body: &[u8],
         mut analysis: Group2Analysis,
+        state_valid: bool,
     ) -> Group2Analysis {
         if body[0] & 0x80 == 0 {
             analysis
@@ -571,18 +637,25 @@ impl Group2Decoder {
                 .push("Request flag set on a response identifier".into());
         }
         let key = RequestKey {
+            bus: message.bus,
             device_mac,
             client_mac: header & 0x3f,
             xid: (header >> 6) & 1,
         };
-        let request = self.requests.remove(&key);
+        let request = self.requests.get(&key).cloned();
+        let response_matches_request = request
+            .as_ref()
+            .is_some_and(|request| request.service_code == service_code);
+        if state_valid && (response_matches_request || service_code == 0x14) {
+            self.requests.remove(&key);
+        }
 
         if service_code == 0x14 {
             analysis.title = "Explicit Error Response".into();
             if let Some(general) = body.get(1).copied() {
                 analysis.push(
                     "General error",
-                    format!("0x{general:02X} - {}", general_error_name(general)),
+                    format!("0x{general:02X} - {}", general_status_name(general)),
                 );
             } else {
                 analysis.warnings.push("Missing General Error code".into());
@@ -590,7 +663,10 @@ impl Group2Decoder {
             if let Some(additional) = body.get(2).copied() {
                 analysis.push(
                     "Additional code",
-                    format!("0x{additional:02X} - {}", additional_error_name(additional)),
+                    format!(
+                        "0x{additional:02X} - {}",
+                        additional_error_name(additional, request.as_ref())
+                    ),
                 );
             } else {
                 analysis
@@ -601,8 +677,14 @@ impl Group2Decoder {
             return analysis;
         }
 
-        match service_code {
-            0x4b => {
+        match (service_code, request.as_ref().map(|request| request.kind)) {
+            (0x4b, Some(RequestKind::AllocateControllerDevice)) => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    true,
+                );
                 if let Some(format_byte) = body.get(1).copied() {
                     let format = MessageBodyFormat::from_value(format_byte & 0x0f);
                     analysis.push("Message body format", format.label());
@@ -610,8 +692,8 @@ impl Group2Decoder {
                         analysis
                             .warnings
                             .push("Reserved Message Body Format value".into());
-                    } else {
-                        self.body_formats.insert(device_mac, format);
+                    } else if state_valid && response_matches_request {
+                        self.body_formats.insert((message.bus, device_mac), format);
                     }
                     if format_byte & 0xf0 != 0 {
                         analysis.push("Reserved format bits", format!("0x{:X}", format_byte >> 4));
@@ -620,13 +702,43 @@ impl Group2Decoder {
                     analysis.warnings.push("Missing Message Body Format".into());
                 }
             }
-            0x4c => {
+            (0x4c, Some(RequestKind::ReleaseControllerDevice { choice })) => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    true,
+                );
                 if body.len() > 1 {
                     analysis.push("Unexpected response data", hex_bytes(&body[1..]));
                 }
+                if state_valid
+                    && response_matches_request
+                    && choice.is_some_and(|value| value & 1 != 0)
+                {
+                    self.body_formats.remove(&(message.bus, device_mac));
+                }
             }
-            0x4d => decode_heartbeat(body, &mut analysis),
-            0x4e => decode_shutdown(body, &mut analysis),
+            (0x4d, None) if is_valid_broadcast(message, header, device_mac, body) => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    true,
+                );
+                mark_broadcast_source_header(&mut analysis, header, device_mac);
+                decode_heartbeat(body, &mut analysis);
+            }
+            (0x4e, None) if is_valid_broadcast(message, header, device_mac, body) => {
+                set_service_identity(
+                    &mut analysis,
+                    service_code,
+                    device_net_service_name(service_code),
+                    true,
+                );
+                mark_broadcast_source_header(&mut analysis, header, device_mac);
+                decode_shutdown(body, &mut analysis);
+            }
             _ => append_service_details(
                 &mut analysis,
                 decode_common_service_data(service_code, true, &body[1..], false),
@@ -635,7 +747,6 @@ impl Group2Decoder {
         attach_request_context(&mut analysis, request.as_ref());
         if let Some(request) = request
             && request.service_code != service_code
-            && !matches!(service_code, 0x4d | 0x4e)
         {
             analysis.warnings.push(format!(
                 "Response service 0x{service_code:02X} does not match request service 0x{:02X}",
@@ -701,7 +812,14 @@ fn parse_request_address(
                 let available = body.len().saturating_sub(2);
                 let used = path_bytes.min(available);
                 analysis.push("Path size", format!("{words} words / {path_bytes} bytes"));
-                analysis.push("Packed EPATH", hex_bytes(&body[2..2 + used]));
+                let path = &body[2..2 + used];
+                analysis.push("Packed EPATH", hex_bytes(path));
+                let logical_path = decode_logical_path(path);
+                parsed.class_id = logical_path.class_id;
+                parsed.instance_id = logical_path.instance_id;
+                if let Some(display) = logical_path.display {
+                    analysis.push("Logical path", display);
+                }
                 parsed.data_offset = 2 + used;
                 if used != path_bytes {
                     analysis.warnings.push(format!(
@@ -735,15 +853,25 @@ fn parse_request_address(
     parsed
 }
 
-fn decode_allocation_request(data: &[u8], analysis: &mut Group2Analysis) {
+fn decode_allocation_request(data: &[u8], require_explicit: bool, analysis: &mut Group2Analysis) {
     let Some(choice) = data.first().copied() else {
         analysis.warnings.push("Missing Allocation Choice".into());
         return;
     };
     analysis.push("Allocation Choice", choice_description(choice, true));
     validate_choice(choice, true, analysis);
+    if require_explicit && choice & 0x01 == 0 {
+        analysis
+            .warnings
+            .push("Group 2 Only allocation must include the Explicit Messaging connection".into());
+    }
     if let Some(allocator) = data.get(1).copied() {
-        analysis.push("Allocator MAC ID", format!("{allocator}"));
+        analysis.push("Allocator MAC ID", format!("{}", allocator & 0x3f));
+        if allocator & 0xc0 != 0 {
+            analysis
+                .warnings
+                .push("Allocator MAC ID reserved bits 7-6 must be zero".into());
+        }
     } else {
         analysis.warnings.push("Missing Allocator MAC ID".into());
     }
@@ -838,6 +966,11 @@ fn decode_heartbeat(body: &[u8], analysis: &mut Group2Analysis) {
         format!("0x{:02X} - {}", body[3], device_state_name(body[3])),
     );
     let flags = body[4];
+    if flags & 0xf8 != 0 {
+        analysis
+            .warnings
+            .push("Heartbeat Fault Flags bits 7-3 must be zero".into());
+    }
     analysis.push(
         "Fault flags",
         format!(
@@ -852,6 +985,10 @@ fn decode_heartbeat(body: &[u8], analysis: &mut Group2Analysis) {
         "Configuration consistency",
         format_u16(u16::from_le_bytes([body[5], body[6]])),
     );
+}
+
+fn is_valid_broadcast(message: &TraceMessage, header: u8, device_mac: u8, body: &[u8]) -> bool {
+    header & 0x80 == 0 && header & 0x3f == device_mac && body.len() == 7 && message.data.len() == 8
 }
 
 fn decode_shutdown(body: &[u8], analysis: &mut Group2Analysis) {
@@ -893,8 +1030,9 @@ fn attach_request_context(analysis: &mut Group2Analysis, request: Option<&Reques
         return;
     };
     analysis.push("Request frame", format!("#{}", request.message_number));
-    analysis.push(
+    analysis.push_service(
         "Request service",
+        request.service_code,
         format!("0x{:02X} - {}", request.service_code, request.service_name),
     );
     if let Some(class_id) = request.class_id {
@@ -930,7 +1068,7 @@ fn mac_role(message_id: u8) -> &'static str {
     }
 }
 
-fn group2_service_name(code: u8) -> &'static str {
+fn device_net_service_name(code: u8) -> &'static str {
     match code {
         0x4b => "Allocate_Controller/Device_Connection_Set",
         0x4c => "Release_Controller/Device_Connection_Set",
@@ -940,21 +1078,48 @@ fn group2_service_name(code: u8) -> &'static str {
     }
 }
 
-fn fragment_type_name(value: u8) -> &'static str {
-    match value {
-        0 => "First",
-        1 => "Middle",
-        2 => "Last",
-        3 => "Acknowledge",
-        _ => "Reserved",
+fn set_service_identity(
+    analysis: &mut Group2Analysis,
+    code: u8,
+    name: &'static str,
+    is_response: bool,
+) {
+    analysis.title = format!(
+        "{name} {}",
+        if is_response { "Response" } else { "Request" }
+    );
+    if let Some(field) = analysis
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "Service")
+    {
+        field.value = format!("0x{code:02X} - {name}");
+        field.service_code = Some(code);
     }
 }
 
-fn fragment_ack_status(value: u8) -> String {
-    match value {
-        0 => "0x00 - Success".into(),
-        1 => "0x01 - Too Much Data".into(),
-        value => format!("0x{value:02X} - Reserved"),
+fn mark_broadcast_source_header(
+    analysis: &mut Group2Analysis,
+    header: u8,
+    identifier_source_mac: u8,
+) {
+    let header_source_mac = header & 0x3f;
+    if let Some(field) = analysis
+        .fields
+        .iter_mut()
+        .find(|field| field.name == "Destination MAC ID")
+    {
+        field.name = "Header Source MAC ID".into();
+    }
+    if header_source_mac != identifier_source_mac {
+        analysis.warnings.push(format!(
+            "Broadcast header Source MAC ID {header_source_mac} does not match Identifier Source MAC ID {identifier_source_mac}"
+        ));
+    }
+    if header & 0x80 != 0 {
+        analysis
+            .warnings
+            .push("Heartbeat and Shutdown messages shall not be fragmented".into());
     }
 }
 
@@ -972,38 +1137,28 @@ fn append_service_details(analysis: &mut Group2Analysis, details: crate::service
     analysis.warnings.extend(details.warnings);
 }
 
-fn general_error_name(code: u8) -> &'static str {
-    match code {
-        0x01 => "Connection failure",
-        0x02 => "Resource unavailable",
-        0x03 => "Invalid parameter value",
-        0x04 => "Path segment error",
-        0x05 => "Path destination unknown",
-        0x06 => "Partial transfer",
-        0x08 => "Service not supported",
-        0x09 => "Invalid attribute value",
-        0x0b => "Already in requested mode/state",
-        0x0c => "Cannot perform service in current mode/state",
-        0x0e => "Attribute not settable",
-        0x10 => "Device state conflict",
-        0x13 => "Not enough data",
-        0x14 => "Attribute not supported",
-        0x15 => "Too much data",
-        0x16 => "Object does not exist",
-        0x20 => "Invalid parameter",
-        0xff => "Object-specific error",
-        _ => "Unknown general status",
+fn additional_error_name(code: u8, request: Option<&RequestContext>) -> &'static str {
+    if code == 0xff {
+        return "No additional information";
     }
-}
-
-fn additional_error_name(code: u8) -> &'static str {
+    if code == 0x03 && request.is_some_and(|request| request.message_id == 6) {
+        return "Invalid service on Group 2 Only unconnected port";
+    }
+    let is_devicenet_management = request.is_some_and(|request| {
+        matches!(
+            request.kind,
+            RequestKind::AllocateControllerDevice | RequestKind::ReleaseControllerDevice { .. }
+        )
+    });
+    if !is_devicenet_management {
+        return "Object/service-specific additional status";
+    }
     match code {
         0x01 => "Allocation conflict",
         0x02 => "Invalid Allocation/Release Choice",
         0x03 => "Invalid service on Group 2 Only unconnected port",
         0x04 => "Required connection resource unavailable",
-        0xff => "No DeviceNet-specific additional code",
-        _ => "Object/service-specific additional code",
+        _ => "DeviceNet Object-specific additional status",
     }
 }
 
@@ -1043,6 +1198,7 @@ fn format_u32(value: u32) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
 
@@ -1055,6 +1211,13 @@ mod tests {
             identifier: id,
             dlc: data.len(),
             data: data.to_vec(),
+        }
+    }
+
+    fn message_on_bus(number: u64, bus: u32, id: u32, data: &[u8]) -> TraceMessage {
+        TraceMessage {
+            bus,
+            ..message(number, id, data)
         }
     }
 
@@ -1091,6 +1254,32 @@ mod tests {
                 Group2Function::DuplicateMacIdCheck,
             ]
         );
+    }
+
+    #[test]
+    fn maps_section_3_7_group2_identifiers_and_mac_roles() {
+        let messages = (0_u32..=7)
+            .map(|message_id| message(u64::from(message_id) + 1, group2_id(21, message_id), &[0]))
+            .collect::<Vec<_>>();
+        let decoded = decode_group2_trace_ordered(&messages);
+        let roles = [
+            "Source MAC ID",
+            "Multicast MAC ID",
+            "Destination MAC ID",
+            "Source MAC ID",
+            "Destination MAC ID",
+            "Destination MAC ID",
+            "Destination MAC ID",
+            "Destination MAC ID",
+        ];
+        for (message_id, expected_role) in roles.into_iter().enumerate() {
+            let analysis = decoded[message_id].as_ref().unwrap();
+            assert_eq!(messages[message_id].identifier, 0x4a8 + message_id as u32);
+            assert_eq!(analysis.field(expected_role), Some("21"));
+        }
+
+        assert_eq!(group2_id(0, 0), 0x400);
+        assert_eq!(group2_id(63, 7), 0x5ff);
     }
 
     #[test]
@@ -1140,6 +1329,35 @@ mod tests {
     }
 
     #[test]
+    fn complete_messages_reset_fragment_reassembly() {
+        let messages = vec![
+            message(1, group2_id(1, 3), &[0x80, 0x00, 0x8e, 1]),
+            message(2, group2_id(1, 3), &[0x00, 0x8e, 0xaa]),
+            message(3, group2_id(1, 3), &[0x80, 0x81, 0xbb]),
+            message(4, group2_id(2, 3), &[0x80, 0x00, 0x8e, 1]),
+            message(5, group2_id(2, 3), &[0x80, 0x41, 2]),
+            message(6, group2_id(2, 3), &[0x80, 0x81, 3]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("before a first"))
+        );
+        assert!(
+            decoded[5]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Expected fragment count"))
+        );
+    }
+
+    #[test]
     fn decodes_duplicate_mac_heartbeat_shutdown_and_error() {
         let messages = vec![
             message(1, group2_id(10, 7), &[0x80, 6, 0, 8, 7, 6, 5]),
@@ -1170,7 +1388,28 @@ mod tests {
         );
         assert_eq!(
             decoded[&4].field("Additional code"),
-            Some("0x03 - Invalid service on Group 2 Only unconnected port")
+            Some("0x03 - Object/service-specific additional status")
+        );
+    }
+
+    #[test]
+    fn only_decodes_well_formed_unsolicited_broadcasts() {
+        let messages = vec![
+            // Header Source MAC 4 does not match Identifier Source MAC 3.
+            message(1, group2_id(3, 3), &[4, 0xcd, 1, 0, 0, 0, 0, 0]),
+            // EV (bit 3) shall be zero in a Device Heartbeat.
+            message(2, group2_id(3, 3), &[3, 0xcd, 1, 0, 3, 8, 0, 0]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert_ne!(decoded[0].as_ref().unwrap().title, "Device Heartbeat");
+        assert_eq!(decoded[1].as_ref().unwrap().title, "Device Heartbeat");
+        assert!(
+            decoded[1]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("bits 7-3"))
         );
     }
 
@@ -1191,5 +1430,148 @@ mod tests {
             decoded[1].as_ref().unwrap().function,
             Group2Function::IoPollOrChangeOfStateOrCyclic
         );
+    }
+
+    #[test]
+    fn keeps_message_body_format_state_isolated_per_bus() {
+        // Volume 3, 3-5.1 and 3-5.2: allocation selects the format for the
+        // target DeviceNet connection. A trace may contain several CAN buses.
+        let messages = vec![
+            message_on_bus(1, 1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message_on_bus(2, 1, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message_on_bus(3, 2, group2_id(3, 4), &[0x0a, 0x0e, 5, 2, 9]),
+            message_on_bus(4, 1, group2_id(3, 4), &[0x0a, 0x0e, 5, 2, 9]),
+        ];
+
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Message body format"),
+            Some("Unknown (allocation response not seen)")
+        );
+        assert_eq!(
+            decoded[3].as_ref().unwrap().field("Message body format"),
+            Some("DeviceNet 8/8")
+        );
+    }
+
+    #[test]
+    fn keeps_object_specific_services_distinct_from_devicenet_management() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message(3, group2_id(3, 4), &[0x0a, 0x4b, 5, 2, 0xaa]),
+            message(4, group2_id(3, 3), &[0x0a, 0xcb, 0xbb]),
+        ];
+
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("Object_Class_Specific_Service")
+        );
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .field("Allocation Choice")
+                .is_none()
+        );
+        assert!(
+            decoded[3]
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("Object_Class_Specific_Service")
+        );
+    }
+
+    #[test]
+    fn release_of_explicit_connection_clears_learned_body_format() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 0]),
+            message(3, group2_id(3, 6), &[0x0a, 0x4c, 3, 1, 1]),
+            message(4, group2_id(3, 3), &[0x0a, 0xcc]),
+            message(5, group2_id(3, 4), &[0x0a, 0x0e, 5, 2, 9]),
+        ];
+
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert_eq!(
+            decoded[4].as_ref().unwrap().field("Message body format"),
+            Some("Unknown (allocation response not seen)")
+        );
+    }
+
+    #[test]
+    fn cip_path_management_request_updates_connection_state() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 1, 0x0a]),
+            message(2, group2_id(3, 3), &[0x0a, 0xcb, 4]),
+            message(3, group2_id(3, 4), &[0x0a, 0x4c, 2, 0x20, 3, 0x24, 1, 1]),
+            message(4, group2_id(3, 3), &[0x0a, 0xcc]),
+            message(5, group2_id(3, 4), &[0x0a, 0x0e, 5, 2, 9]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+        let release = decoded[2].as_ref().unwrap();
+        assert!(release.title.contains("Release_Controller"));
+        assert_eq!(release.field("Class ID"), Some("0x3 (3)"));
+        assert_eq!(release.field("Instance ID"), Some("0x1 (1)"));
+        assert_eq!(
+            decoded[4].as_ref().unwrap().field("Message body format"),
+            Some("Unknown (allocation response not seen)")
+        );
+    }
+
+    #[test]
+    fn validates_group2_only_allocation_constraints() {
+        let messages = vec![message(1, group2_id(3, 6), &[0x0a, 0x4b, 3, 1, 2, 0xca])];
+        let decoded = decode_group2_trace_ordered(&messages);
+        let analysis = decoded[0].as_ref().unwrap();
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("must include"))
+        );
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("reserved bits"))
+        );
+        assert_eq!(analysis.field("Allocator MAC ID"), Some("10"));
+    }
+
+    #[test]
+    fn labels_group2_only_invalid_service_error_from_request_context() {
+        let messages = vec![
+            message(1, group2_id(3, 6), &[0x0a, 0x0e, 3, 1, 1]),
+            message(2, group2_id(3, 3), &[0x0a, 0x94, 2, 3]),
+            message(3, group2_id(3, 3), &[0x0b, 0x94, 2, 0xff]),
+        ];
+        let decoded = decode_group2_trace_ordered(&messages);
+        assert_eq!(
+            decoded[1].as_ref().unwrap().field("Additional code"),
+            Some("0x03 - Invalid service on Group 2 Only unconnected port")
+        );
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Additional code"),
+            Some("0xFF - No additional information")
+        );
+    }
+
+    #[test]
+    fn does_not_invent_an_attribute_when_body_format_is_unknown() {
+        let messages = vec![message(1, group2_id(3, 4), &[0x0a, 0x0e, 5, 2, 9])];
+        let decoded = decode_group2_trace_ordered(&messages);
+        let analysis = decoded[0].as_ref().unwrap();
+        assert_eq!(
+            analysis.field("Message body format"),
+            Some("Unknown (allocation response not seen)")
+        );
+        assert_eq!(analysis.field("Attribute ID"), None);
+        assert_eq!(analysis.field("Service data"), Some("05 02 09"));
     }
 }
