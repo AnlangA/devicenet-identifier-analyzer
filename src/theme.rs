@@ -1,7 +1,6 @@
 use eframe::egui::{self, Color32, FontData, FontDefinitions, FontFamily, FontId, Stroke, Vec2};
 
-/// 嵌入的宋体中文字体（思源宋体 Noto Serif CJK SC，Regular 字重）。
-/// 使用 `include_bytes!` 在编译期将字体嵌入二进制，确保应用独立分发。
+/// Embedded CJK fallback used when egui's default sans font has no glyph.
 static NOTO_SERIF_SC: &[u8] = include_bytes!("../assets/fonts/NotoSerifSC-Regular.otf");
 
 pub(crate) const BG: Color32 = Color32::from_rgb(11, 17, 28);
@@ -42,6 +41,7 @@ pub(crate) fn configure(ctx: &egui::Context) {
     style.visuals.window_stroke = Stroke::new(1.0, BORDER);
     style.spacing.item_spacing = Vec2::new(8.0, 6.0);
     style.spacing.button_padding = Vec2::new(10.0, 6.0);
+    style.spacing.interact_size = Vec2::new(40.0, 32.0);
     style.spacing.tooltip_width = 380.0;
     style.text_styles.insert(
         egui::TextStyle::Body,
@@ -50,13 +50,8 @@ pub(crate) fn configure(ctx: &egui::Context) {
     ctx.set_style_of(egui::Theme::Dark, style);
 }
 
-/// 安装嵌入的中文字体（思源宋体）作为 Proportional 的最高优先级字体，
-/// 同时挂到 Monospace 末尾作为回退，使中文字符在等宽场景也能显示。
-///
-/// 这是 egui 0.35 推荐的字体嵌入方式：
-/// 1. 从 `FontDefinitions::default()` 起步（保留内置拉丁字体）。
-/// 2. `font_data` 中插入自定义字体的二进制（`.ttf` / `.otf` 均可）。
-/// 3. 在 `families` 中将自定义字体名加入相应 `FontFamily`，靠前的字体优先匹配。
+/// Keep egui's sans font first for a modern Latin UI and use the embedded CJK
+/// font only as a fallback. Monospace keeps its built-in metrics as well.
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
 
@@ -65,14 +60,12 @@ fn install_fonts(ctx: &egui::Context) {
         std::sync::Arc::new(FontData::from_static(NOTO_SERIF_SC)),
     );
 
-    // 最高优先级：中文字符优先由宋体渲染。
     fonts
         .families
         .get_mut(&FontFamily::Proportional)
         .unwrap()
-        .insert(0, "noto-serif-sc".to_owned());
+        .push("noto-serif-sc".to_owned());
 
-    // Monospace 末尾追加作为回退，避免破坏等宽英文字体的排版。
     fonts
         .families
         .get_mut(&FontFamily::Monospace)

@@ -1,12 +1,16 @@
 use crate::ai_import::{AiEndpoint, AiImportOutput, AiImportRequest, request_can_frames};
+use crate::document::{AnalyzedFrame, TraceDocument, TraceStats};
+#[cfg(test)]
+use crate::document::{analyze_frames, build_search_text};
 use crate::frame_input::{FrameOrigin, NewCanFrame, format_saved_frame};
+use crate::settings::{AI_CONFIG_KEY, AiConfig, IO_ASSEMBLY_CONFIG_KEY};
 use crate::theme;
+#[cfg(test)]
+use devicenet_identifier_analyzer::decode_trace_ordered_with_io;
 use devicenet_identifier_analyzer::{
-    FrameAnalysis, IoAssemblySelection, MessageGroup, TraceMessage, compare_optional_time,
-    decode_trace_ordered_with_io, parse_trace_log,
+    FrameAnalysis, IoAssemblySelection, TraceMessage, compare_optional_time, parse_trace_log,
 };
 use eframe::egui;
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 
@@ -93,99 +97,6 @@ impl Default for MessageFilters {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct TraceStats {
-    pub(crate) tx: usize,
-    pub(crate) rx: usize,
-    pub(crate) group1: usize,
-    pub(crate) group2: usize,
-    pub(crate) group3: usize,
-    pub(crate) group4: usize,
-    pub(crate) io_assembly_candidates: usize,
-    pub(crate) warnings: usize,
-    pub(crate) user_created: usize,
-    pub(crate) duration_ms: f64,
-}
-
-impl TraceStats {
-    fn from_frames(frames: &[AnalyzedFrame]) -> Self {
-        let tx = frames
-            .iter()
-            .filter(|frame| frame.message.direction.eq_ignore_ascii_case("Tx"))
-            .count();
-        let rx = frames
-            .iter()
-            .filter(|frame| frame.message.direction.eq_ignore_ascii_case("Rx"))
-            .count();
-        let count_group = |group| {
-            frames
-                .iter()
-                .filter_map(|frame| frame.analysis.as_ref())
-                .filter(|analysis| analysis.group == group)
-                .count()
-        };
-        let group1 = count_group(MessageGroup::Group1);
-        let group2 = count_group(MessageGroup::Group2);
-        let group3 = count_group(MessageGroup::Group3);
-        let group4 = count_group(MessageGroup::Group4);
-        let io_assembly_candidates = frames
-            .iter()
-            .filter(|frame| {
-                !frame.message.data.is_empty()
-                    && frame
-                        .analysis
-                        .as_ref()
-                        .is_some_and(|analysis| analysis.function.has_io_assembly_payload())
-            })
-            .count();
-        let warnings = frames
-            .iter()
-            .filter_map(|frame| frame.analysis.as_ref())
-            .map(|analysis| analysis.warnings.len())
-            .sum();
-        let user_created = frames
-            .iter()
-            .filter(|frame| frame.origin.is_user_created())
-            .count();
-        let mut times = frames
-            .iter()
-            .filter_map(|frame| frame.message.time_offset_ms);
-        let duration_ms = times.next().map_or(0.0, |first| {
-            let (minimum, maximum) = times.fold((first, first), |(minimum, maximum), time| {
-                (minimum.min(time), maximum.max(time))
-            });
-            maximum - minimum
-        });
-
-        Self {
-            tx,
-            rx,
-            group1,
-            group2,
-            group3,
-            group4,
-            io_assembly_candidates,
-            warnings,
-            user_created,
-            duration_ms,
-        }
-    }
-}
-
-pub(crate) struct AnalyzedFrame {
-    pub(crate) message: TraceMessage,
-    pub(crate) analysis: Option<FrameAnalysis>,
-    pub(crate) origin: FrameOrigin,
-    search_text: String,
-}
-
-pub(crate) struct TraceDocument {
-    pub(crate) path: PathBuf,
-    pub(crate) frames: Vec<AnalyzedFrame>,
-    pub(crate) skipped_message_lines: usize,
-    pub(crate) stats: TraceStats,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InputTab {
     Manual,
@@ -210,89 +121,8 @@ pub(crate) struct AiInputForm {
     pub(crate) message: Option<Result<String, String>>,
 }
 
-/// `eframe` 持久化使用的 `Storage` 键。整个应用仅保存一份 AI 配置。
-pub(crate) const AI_CONFIG_KEY: &str = "ai-config";
-
-/// 需要在本地持久化的 AI 相关配置。
-///
-/// 仅包含用户一次配置后应跨会话保留的字段（`api_key`、`endpoint`、
-/// `custom_base_url`）；`user_input` / `last_json` / `message` 等属于会话级状态，
-/// 不需要持久化，因此不在此结构中。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct AiConfig {
-    pub(crate) api_key: String,
-    pub(crate) endpoint: AiEndpoint,
-    pub(crate) custom_base_url: String,
-}
-
-impl AiConfig {
-    /// 从当前表单状态中提取需要持久化的配置。
-    pub(crate) fn from_form(form: &AiInputForm) -> Self {
-        Self {
-            api_key: form.api_key.clone(),
-            endpoint: form.endpoint,
-            custom_base_url: form.custom_base_url.clone(),
-        }
-    }
-
-    /// 将持久化的配置回填到表单字段。
-    pub(crate) fn apply_to(self, form: &mut AiInputForm) {
-        form.api_key = self.api_key;
-        form.endpoint = self.endpoint;
-        form.custom_base_url = self.custom_base_url;
-    }
-
-    /// 序列化为 JSON 后加密，返回 Base64 密文字符串。失败返回 `None`。
-    /// 该字符串随后通过 eframe 的 `Storage` 落盘。
-    pub(crate) fn encrypt(&self) -> Option<String> {
-        let json = serde_json::to_string(self).ok()?;
-        crate::secret::encrypt(&json)
-    }
-
-    /// 解密 Base64 密文字符串并反序列化为 `AiConfig`。
-    /// 任何环节失败都返回 `None`（调用方按“无保存配置”处理）。
-    pub(crate) fn decrypt(encoded: &str) -> Option<Self> {
-        let json = crate::secret::decrypt(encoded)?;
-        serde_json::from_str(&json).ok()
-    }
-}
-
 struct AiJob {
     receiver: Receiver<Result<AiImportOutput, String>>,
-}
-
-impl TraceDocument {
-    fn from_messages(
-        path: PathBuf,
-        messages: Vec<TraceMessage>,
-        origins: Vec<FrameOrigin>,
-        io_assembly: IoAssemblySelection,
-    ) -> Self {
-        let frames = analyze_frames(messages, origins, io_assembly);
-        let stats = TraceStats::from_frames(&frames);
-        Self {
-            path,
-            frames,
-            skipped_message_lines: 0,
-            stats,
-        }
-    }
-
-    fn reanalyze(&mut self, io_assembly: IoAssemblySelection) {
-        let (messages, origins) = std::mem::take(&mut self.frames)
-            .into_iter()
-            .map(|frame| (frame.message, frame.origin))
-            .unzip();
-        self.frames = analyze_frames(messages, origins, io_assembly);
-        self.stats = TraceStats::from_frames(&self.frames);
-    }
-
-    pub(crate) fn file_name(&self) -> &str {
-        self.path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Trace file")
-    }
 }
 
 pub(crate) struct AnalyzerApp {
@@ -343,8 +173,16 @@ impl AnalyzerApp {
         if let Some(storage) = cc.storage.as_ref() {
             if let Some(encoded) = storage.get_string(AI_CONFIG_KEY) {
                 if let Some(config) = AiConfig::decrypt(&encoded) {
-                    config.apply_to(&mut app.ai_input);
+                    app.ai_input.api_key = config.api_key;
+                    app.ai_input.endpoint = config.endpoint;
+                    app.ai_input.custom_base_url = config.custom_base_url;
                 }
+            }
+            if let Some(encoded) = storage.get_string(IO_ASSEMBLY_CONFIG_KEY)
+                && let Ok(selection) = serde_json::from_str::<IoAssemblySelection>(&encoded)
+                && selection.is_valid()
+            {
+                app.io_assembly = selection;
             }
         }
 
@@ -369,11 +207,10 @@ impl AnalyzerApp {
                 }
 
                 let origins = vec![FrameOrigin::File; trace.messages.len()];
-                let io_assembly = IoAssemblySelection::default();
+                let io_assembly = self.io_assembly;
                 let mut document =
                     TraceDocument::from_messages(path, trace.messages, origins, io_assembly);
                 document.skipped_message_lines = trace.skipped_message_lines;
-                self.io_assembly = io_assembly;
                 self.document = Some(document);
                 self.filters = MessageFilters::default();
                 self.sort_order = SortOrder::Ascending;
@@ -665,33 +502,6 @@ impl AnalyzerApp {
     }
 }
 
-fn analyze_frames(
-    messages: Vec<TraceMessage>,
-    origins: Vec<FrameOrigin>,
-    io_assembly: IoAssemblySelection,
-) -> Vec<AnalyzedFrame> {
-    assert_eq!(
-        messages.len(),
-        origins.len(),
-        "every trace message must have exactly one origin"
-    );
-    let analyses = decode_trace_ordered_with_io(&messages, io_assembly);
-    messages
-        .into_iter()
-        .zip(analyses)
-        .zip(origins)
-        .map(|((message, analysis), origin)| {
-            let search_text = build_search_text(&message, analysis.as_ref());
-            AnalyzedFrame {
-                message,
-                analysis,
-                origin,
-                search_text,
-            }
-        })
-        .collect()
-}
-
 fn direction_matches(message: &TraceMessage, filter: DirectionFilter) -> bool {
     match filter {
         DirectionFilter::All => true,
@@ -713,36 +523,6 @@ fn scope_matches(
         FrameScope::Group4 => (0x7c0..=0x7ef).contains(&message.identifier),
         FrameScope::Explicit => analysis.is_some_and(|analysis| analysis.function.is_explicit()),
     }
-}
-
-fn build_search_text(message: &TraceMessage, analysis: Option<&FrameAnalysis>) -> String {
-    let mut text = format!(
-        "{:03X}\n{}\n{}\n{}\n{}",
-        message.identifier,
-        message.number,
-        message.bus,
-        message.direction.to_ascii_uppercase(),
-        message.data_hex()
-    );
-    if let Some(analysis) = analysis {
-        text.push('\n');
-        text.push_str(&analysis.title.to_ascii_uppercase());
-        for field in &analysis.fields {
-            text.push('\n');
-            text.push_str(&field.name.to_ascii_uppercase());
-            text.push('\n');
-            text.push_str(&field.value.to_ascii_uppercase());
-            if let Some(unit) = &field.unit {
-                text.push('\n');
-                text.push_str(&unit.to_ascii_uppercase());
-            }
-            if let Some(description) = &field.description {
-                text.push('\n');
-                text.push_str(&description.to_ascii_uppercase());
-            }
-        }
-    }
-    text
 }
 
 #[cfg(test)]

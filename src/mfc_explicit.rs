@@ -7,7 +7,10 @@
 
 use std::collections::HashMap;
 
-use crate::{DecodedField, path::decode_logical_path};
+use crate::{
+    AnalysisSubject, DecodedField, DecodedFieldRole, ExplicitOperation, path::decode_logical_path,
+    profile::explicit_attribute,
+};
 
 const BLUE_DYNAMICS_VENDOR_ID: u16 = 1813;
 const TYPE_BOOL: u8 = 0xc1;
@@ -54,6 +57,7 @@ pub(crate) struct AttributeDecode {
     pub(crate) fields: Vec<DecodedField>,
     pub(crate) warnings: Vec<String>,
     pub(crate) pending_update: Option<PendingAttributeUpdate>,
+    pub(crate) subject: Option<AnalysisSubject>,
 }
 
 #[derive(Debug, Default)]
@@ -179,10 +183,14 @@ impl MfcExplicitState {
         instance_id: u32,
         attribute_id: u32,
     ) -> AttributeDecode {
+        let metadata = explicit_attribute(class_id, instance_id, attribute_id);
         AttributeDecode {
             fields: request_target_field(class_id, instance_id, attribute_id, false)
                 .into_iter()
                 .collect(),
+            subject: metadata.map(|metadata| {
+                AnalysisSubject::Explicit(metadata.subject(ExplicitOperation::Read))
+            }),
             ..AttributeDecode::default()
         }
     }
@@ -209,6 +217,9 @@ impl MfcExplicitState {
             fields: decoded.fields,
             warnings: decoded.warnings,
             pending_update: None,
+            subject: explicit_attribute(class_id, instance_id, attribute_id).map(|metadata| {
+                AnalysisSubject::Explicit(metadata.subject(ExplicitOperation::Read))
+            }),
         }
     }
 
@@ -233,6 +244,9 @@ impl MfcExplicitState {
             fields: decoded.fields,
             warnings: decoded.warnings,
             pending_update,
+            subject: explicit_attribute(class_id, instance_id, attribute_id).map(|metadata| {
+                AnalysisSubject::Explicit(metadata.subject(ExplicitOperation::Write))
+            }),
         }
     }
 
@@ -351,31 +365,20 @@ fn decode_attribute(
     };
 
     if is_set
-        && attribute_target_name(class_id, instance_id, attribute_id).is_some()
-        && !is_settable(class_id, instance_id, attribute_id)
+        && explicit_attribute(class_id, instance_id, attribute_id).is_some()
+        && !explicit_attribute(class_id, instance_id, attribute_id)
+            .is_some_and(|metadata| metadata.writable)
     {
         decoded.mutations.clear();
+        let target = explicit_attribute(class_id, instance_id, attribute_id)
+            .expect("table target was checked above")
+            .target_label();
         decoded.warnings.push(format!(
             "Set_Attribute_Single targets read-only {}; the supplied value was decoded for display, but no decoder context will be updated",
-            attribute_target_name(class_id, instance_id, attribute_id).unwrap()
+            target
         ));
     }
     decoded
-}
-
-fn is_settable(class_id: u32, instance_id: u32, attribute_id: u32) -> bool {
-    match (class_id, instance_id) {
-        (0x05, 1) => matches!(attribute_id, 9 | 12),
-        (0x05, 2) => matches!(attribute_id, 9 | 14 | 16),
-        (0x30, 1) => matches!(attribute_id, 15 | 16),
-        (0x31, 1) => {
-            matches!(attribute_id, 3 | 4 | 8 | 9 | 17..=24 | 27 | 35)
-        }
-        (0x31, 2 | 3) => matches!(attribute_id, 3 | 4 | 8 | 9 | 17..=24 | 27),
-        (0x32, 1) => matches!(attribute_id, 3 | 4 | 5 | 8 | 9 | 15..=20),
-        (0x33, 1) => matches!(attribute_id, 3 | 4 | 6 | 11..=16 | 19),
-        _ => false,
-    }
 }
 
 fn request_target_field(
@@ -384,189 +387,20 @@ fn request_target_field(
     attribute_id: u32,
     is_write: bool,
 ) -> Option<DecodedField> {
-    let target = attribute_target_name(class_id, instance_id, attribute_id)?;
-    Some(detail(
+    let target = explicit_attribute(class_id, instance_id, attribute_id)?.target_label();
+    Some(DecodedField::target(
         if is_write {
             "Write target"
         } else {
             "Read target"
         },
         target,
-        None,
         if is_write {
             "Set_Attribute_Single writes the supplied value to this table-defined attribute."
         } else {
             "Get_Attribute_Single reads this table-defined attribute; the correlated response carries its value."
         },
     ))
-}
-
-fn attribute_target_name(class_id: u32, instance_id: u32, attribute_id: u32) -> Option<String> {
-    let (object, attribute) = match (class_id, instance_id) {
-        (0x01, 1) => (
-            "Identity",
-            match attribute_id {
-                1 => "Vendor ID",
-                2 => "Device type",
-                3 => "Product code",
-                4 => "Revision",
-                5 => "Identity status",
-                6 => "Serial number",
-                7 => "Product name",
-                _ => return None,
-            },
-        ),
-        (0x03, 1) => (
-            "DeviceNet",
-            match attribute_id {
-                1 => "MAC ID",
-                2 => "Baud rate",
-                3 => "Bus-off interrupt behavior",
-                4 => "Bus-off counter",
-                5 => "Allocation information",
-                6 => "MAC ID switch changed",
-                7 => "Baud-rate switch changed",
-                8 => "MAC ID switch value",
-                9 => "Baud-rate switch value",
-                _ => return None,
-            },
-        ),
-        (0x05, 1 | 2) => (
-            "Connection",
-            match attribute_id {
-                1 => "Connection state",
-                2 => "Instance type",
-                3 => "Transport class trigger",
-                4 => "Produced connection ID",
-                5 => "Consumed connection ID",
-                6 => "Initial communication characteristics",
-                7 => "Produced connection size",
-                8 => "Consumed connection size",
-                9 => "Expected packet rate",
-                12 => "Watchdog timeout action",
-                13 => "Produced connection path length",
-                14 => "Produced connection path",
-                15 => "Consumed connection path length",
-                16 => "Consumed connection path",
-                17 => "Production inhibit time",
-                _ => return None,
-            },
-        ),
-        (0x30, 1) => (
-            "S-Device Supervisor",
-            match attribute_id {
-                1 => "Number of attributes",
-                2 => "Attribute list",
-                3 => "Device type",
-                4 => "SEMI standard revision",
-                5 => "Manufacturer name",
-                6 => "Manufacturer model",
-                7 => "Software revision",
-                8 => "Hardware revision",
-                9 => "Device serial number",
-                10 => "Device configuration",
-                11 => "Device status",
-                12 => "Exception status",
-                13 => "Exception detail alarm",
-                14 => "Exception detail warning",
-                15 => "Alarm enable",
-                16 => "Warning enable",
-                23 => "Run hours",
-                _ => return None,
-            },
-        ),
-        (0x31, 1..=3) => (
-            "S-Analog Sensor",
-            match attribute_id {
-                1 => "Number of attributes",
-                2 => "Attribute list",
-                3 => "Data type",
-                4 => "Data units",
-                5 => "Reading valid",
-                6 => match instance_id {
-                    1 => "Flow",
-                    2 => "Pressure",
-                    3 => "Temperature",
-                    _ => unreachable!(),
-                },
-                7 => "Sensor status",
-                8 => "Alarm enable",
-                9 => "Warning enable",
-                10 => "Numeric full scale",
-                17 => "Alarm trip point high",
-                18 => "Alarm trip point low",
-                19 => "Alarm hysteresis",
-                20 => "Alarm settling time",
-                21 => "Warning trip point high",
-                22 => "Warning trip point low",
-                23 => "Warning hysteresis",
-                24 => "Warning settling time",
-                27 => "Autozero enable",
-                28 => "Autozero status",
-                35 => "Gas calibration object instance",
-                99 => "Subclass",
-                0x6e => "Configured full scale",
-                _ => return None,
-            },
-        ),
-        (0x32, 1) => (
-            "S-Analog Actuator",
-            match attribute_id {
-                1 => "Number of attributes",
-                2 => "Attribute list",
-                3 => "Data type",
-                4 => "Data units",
-                5 => "Override",
-                6 => "Valve",
-                7 => "Actuator status",
-                8 => "Alarm enable",
-                9 => "Warning enable",
-                15 => "Alarm trip point high",
-                16 => "Alarm trip point low",
-                17 => "Alarm hysteresis",
-                18 => "Warning trip point high",
-                19 => "Warning trip point low",
-                20 => "Warning hysteresis",
-                _ => return None,
-            },
-        ),
-        (0x33, 1) => (
-            "S-Single Stage Controller",
-            match attribute_id {
-                1 => "Number of attributes",
-                2 => "Attribute list",
-                3 => "Data type",
-                4 => "Data units",
-                6 => "Setpoint",
-                10 => "Controller status",
-                11 => "Alarm enable",
-                12 => "Warning enable",
-                13 => "Alarm settling time",
-                14 => "Alarm error band",
-                15 => "Warning settling time",
-                16 => "Warning error band",
-                19 => "Ramp rate",
-                _ => return None,
-            },
-        ),
-        (0x34, 1..=5) => (
-            "S-Gas Calibration",
-            match attribute_id {
-                1 => "Number of attributes",
-                2 => "Attribute list",
-                3 => "Gas number",
-                4 => "Sensor instance",
-                5 => "Gas name",
-                6 => "Calibration full scale",
-                8 => "Calibration date",
-                9 => "Calibration gas number",
-                95 => "Calibration pressure",
-                _ => return None,
-            },
-        ),
-        _ => return None,
-    };
-    Some(format!("{object} instance {instance_id} / {attribute}"))
 }
 
 fn decode_identity(attribute_id: u32, data: &[u8]) -> InternalDecode {
@@ -2103,6 +1937,7 @@ fn detail(
     DecodedField {
         name: name.into(),
         value: value.into(),
+        role: DecodedFieldRole::Value,
         service_code: None,
         unit: unit.map(str::to_owned),
         description: Some(description.into()),
@@ -2575,7 +2410,7 @@ mod tests {
         let request = state.describe_get_request(0x31, 1, 6);
         assert_eq!(
             field(&request, "Read target").unwrap().value,
-            "S-Analog Sensor instance 1 / Flow"
+            "Flow sensor / Flow (Class 0x31, Instance 1, Attribute 0x06)"
         );
         assert!(state.describe_get_request(0x30, 1, 25).fields.is_empty());
 
@@ -2598,7 +2433,7 @@ mod tests {
         let setpoint = state.decode_set_request(key(), 0x33, 1, 6, &321i16.to_le_bytes());
         assert_eq!(
             field(&setpoint, "Write target").unwrap().value,
-            "S-Single Stage Controller instance 1 / Setpoint"
+            "Flow controller / Setpoint (Class 0x33, Instance 1, Attribute 0x06)"
         );
         assert_eq!(field(&setpoint, "Setpoint").unwrap().value, "321");
     }
@@ -2625,13 +2460,13 @@ mod tests {
         );
         assert_eq!(
             field(&read_only, "Write target").unwrap().value,
-            "S-Analog Sensor instance 1 / Numeric full scale"
+            "Flow sensor / Numeric full scale (Class 0x31, Instance 1, Attribute 0x0A)"
         );
 
-        assert!(is_settable(0x05, 1, 9));
-        assert!(!is_settable(0x05, 1, 14));
-        assert!(is_settable(0x05, 2, 14));
-        assert!(!is_settable(0x34, 1, 6));
+        assert!(explicit_attribute(0x05, 1, 9).unwrap().writable);
+        assert!(!explicit_attribute(0x05, 1, 14).unwrap().writable);
+        assert!(explicit_attribute(0x05, 2, 14).unwrap().writable);
+        assert!(!explicit_attribute(0x34, 1, 6).unwrap().writable);
     }
 
     #[test]

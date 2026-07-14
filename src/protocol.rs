@@ -9,7 +9,11 @@ use crate::services::{
     ServiceDetails, decode_common_service_data, format_u16, hex_bytes, service_name,
 };
 use crate::status::general_status_name;
-use crate::{DecodedField, IdentifierFields, MessageGroup, TraceMessage, compare_optional_time};
+use crate::{
+    AnalysisSubject, DecodedField, IdentifierFields, IoAssemblySubject, MessageGroup, TraceMessage,
+    compare_optional_time,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,7 +117,7 @@ impl FrameFunction {
 
 pub const DEFAULT_HOST_MAC_ID: u8 = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IoAssemblySelection {
     pub host_mac_id: u8,
     pub input_instance: Option<u8>,
@@ -142,6 +146,16 @@ impl IoAssemblySelection {
             _ => true,
         }
     }
+
+    pub fn is_valid(self) -> bool {
+        self.host_mac_id <= 63
+            && self.input_instance.is_none_or(|number| {
+                assembly_instance(IoAssemblyDirection::Input, number).is_some()
+            })
+            && self.output_instance.is_none_or(|number| {
+                assembly_instance(IoAssemblyDirection::Output, number).is_some()
+            })
+    }
 }
 
 impl Default for IoAssemblySelection {
@@ -159,6 +173,7 @@ pub struct FrameAnalysis {
     pub group: MessageGroup,
     pub function: FrameFunction,
     pub title: String,
+    pub subject: Option<AnalysisSubject>,
     pub fields: Vec<DecodedField>,
     pub warnings: Vec<String>,
 }
@@ -169,6 +184,7 @@ impl FrameAnalysis {
             group,
             function,
             title: title.into(),
+            subject: None,
             fields: Vec::new(),
             warnings: Vec::new(),
         }
@@ -214,6 +230,7 @@ impl From<Group2Analysis> for FrameAnalysis {
             group: MessageGroup::Group2,
             function: FrameFunction::Group2(analysis.function),
             title: analysis.title,
+            subject: analysis.subject,
             fields: analysis.fields,
             warnings: analysis.warnings,
         }
@@ -320,6 +337,7 @@ struct ExplicitRequestContext {
     class_id: Option<u32>,
     instance_id: Option<u32>,
     attribute_id: Option<u32>,
+    subject: Option<AnalysisSubject>,
     pending_attribute_update: Option<PendingAttributeUpdate>,
 }
 
@@ -524,6 +542,13 @@ impl ProtocolDecoder {
             ));
             return analysis;
         };
+        analysis.subject = Some(AnalysisSubject::IoAssembly(IoAssemblySubject {
+            direction,
+            number: instance.number,
+            name: instance.name,
+            profile: instance.profile,
+            byte_len: instance.byte_len,
+        }));
         analysis.push(
             "Assembly instance",
             format!(
@@ -1327,6 +1352,9 @@ impl ProtocolDecoder {
                 ));
             }
             if let Some(request) = request {
+                if response_matches_request || service == 0x14 {
+                    analysis.subject = request.subject;
+                }
                 analysis.push("Request frame", format!("#{}", request.frame));
                 analysis.push_service(
                     "Request service",
@@ -1456,6 +1484,7 @@ impl ProtocolDecoder {
                     class_id: address.class_id,
                     instance_id: address.instance_id,
                     attribute_id,
+                    subject: analysis.subject,
                     pending_attribute_update,
                 },
             );
@@ -2072,7 +2101,11 @@ fn append_attribute_decode(
         fields,
         warnings,
         pending_update,
+        subject,
     } = decoded;
+    if subject.is_some() {
+        analysis.subject = subject;
+    }
     analysis.fields.extend(fields);
     analysis.warnings.extend(warnings);
     pending_update
@@ -2235,18 +2268,25 @@ mod tests {
 
         assert_eq!(
             decoded[2].as_ref().unwrap().field("Read target"),
-            Some("Identity instance 1 / Vendor ID")
+            Some("Device identity / Vendor ID (Class 0x01, Instance 1, Attribute 0x01)")
         );
         assert_eq!(response.field("Attribute data"), Some("15 07"));
         assert_eq!(
             response.field("Read target"),
-            Some("Identity instance 1 / Vendor ID")
+            Some("Device identity / Vendor ID (Class 0x01, Instance 1, Attribute 0x01)")
         );
         assert!(
             response
                 .field("Vendor ID")
                 .is_some_and(|value| value.contains("BLUE DYNAMICS"))
         );
+        assert!(matches!(
+            response.subject,
+            Some(AnalysisSubject::Explicit(subject))
+                if subject.instance_name == "Device identity"
+                    && subject.attribute_name == "Vendor ID"
+                    && subject.operation == crate::ExplicitOperation::Read
+        ));
     }
 
     #[test]
@@ -2604,6 +2644,20 @@ mod tests {
         );
         assert_eq!(decoded[2].as_ref().unwrap().field("Flow"), Some("-2"));
         assert_eq!(decoded[3].as_ref().unwrap().field("Setpoint"), Some("2"));
+        assert!(matches!(
+            decoded[0].as_ref().unwrap().subject,
+            Some(AnalysisSubject::IoAssembly(subject))
+                if subject.direction == IoAssemblyDirection::Input
+                    && subject.number == 2
+                    && subject.name == "Status and Flow"
+        ));
+        assert!(matches!(
+            decoded[1].as_ref().unwrap().subject,
+            Some(AnalysisSubject::IoAssembly(subject))
+                if subject.direction == IoAssemblyDirection::Output
+                    && subject.number == 7
+                    && subject.name == "Setpoint"
+        ));
 
         let flow = decoded[0]
             .as_ref()
@@ -2968,14 +3022,29 @@ mod tests {
 
     #[test]
     fn rejects_an_invalid_host_mac_for_assembly_direction_inference() {
-        let decoded = decode_trace_ordered_with_io(
-            &[message(1, 0x341, &[0, 1, 0])],
+        let invalid = IoAssemblySelection {
+            host_mac_id: 64,
+            input_instance: Some(2),
+            output_instance: Some(7),
+        };
+        assert!(!invalid.is_valid());
+        assert!(
+            !IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(7),
+                output_instance: Some(2),
+            }
+            .is_valid()
+        );
+        assert!(
             IoAssemblySelection {
-                host_mac_id: 64,
+                host_mac_id: 0,
                 input_instance: Some(2),
                 output_instance: Some(7),
-            },
+            }
+            .is_valid()
         );
+        let decoded = decode_trace_ordered_with_io(&[message(1, 0x341, &[0, 1, 0])], invalid);
         assert!(
             decoded[0]
                 .as_ref()

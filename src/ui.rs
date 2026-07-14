@@ -1,22 +1,21 @@
 use crate::ai_import::AiEndpoint;
-use crate::app::{
-    AI_CONFIG_KEY, AiConfig, AnalyzerApp, DirectionFilter, FrameScope, InputTab, MessageFilters,
-};
+use crate::app::{AnalyzerApp, DirectionFilter, FrameScope, InputTab, MessageFilters};
 use crate::frame_input::FrameOrigin;
+use crate::settings::{AI_CONFIG_KEY, AiConfig, IO_ASSEMBLY_CONFIG_KEY};
 use crate::theme::{
     ACCENT, AMBER, BG, BLUE, BORDER, MUTED, PANEL, PANEL_SOFT, PURPLE, RED, SURFACE, TEXT,
 };
 use devicenet_identifier_analyzer::{
-    DecodedIdentifier, FrameAnalysis, FrameFunction, Group2Function, INPUT_ASSEMBLIES,
-    IdentifierFields, IoAssemblyInstance, IoAssemblySelection, MessageGroup, OUTPUT_ASSEMBLIES,
-    TraceMessage, service_description,
+    AnalysisSubject, DecodedField, DecodedFieldRole, DecodedIdentifier, FrameAnalysis,
+    FrameFunction, Group2Function, INPUT_ASSEMBLIES, IdentifierFields, IoAssemblyInstance,
+    IoAssemblySelection, MessageGroup, OUTPUT_ASSEMBLIES, TraceMessage, service_description,
 };
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Pos2, RichText, Sense, Stroke, Vec2,
 };
 use rfd::FileDialog;
 
-const MESSAGE_TABLE_WIDTH: f32 = 640.0;
+const MESSAGE_TABLE_WIDTH: f32 = 980.0;
 const MESSAGE_ROW_HEIGHT: f32 = 28.0;
 const AI_INPUT_HEIGHT: f32 = 150.0;
 
@@ -75,9 +74,16 @@ impl eframe::App for AnalyzerApp {
     /// 为了避免 `api_key` 明文落盘，这里先把配置序列化为 JSON，再用
     /// `crate::secret` 加密为 Base64 字符串，最后以字符串形式写入 `Storage`。
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        let config = AiConfig::from_form(&self.ai_input);
+        let config = AiConfig {
+            api_key: self.ai_input.api_key.clone(),
+            endpoint: self.ai_input.endpoint,
+            custom_base_url: self.ai_input.custom_base_url.clone(),
+        };
         if let Some(encoded) = config.encrypt() {
             storage.set_string(AI_CONFIG_KEY, encoded);
+        }
+        if let Ok(encoded) = serde_json::to_string(&self.io_assembly) {
+            storage.set_string(IO_ASSEMBLY_CONFIG_KEY, encoded);
         }
     }
 }
@@ -675,6 +681,7 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
                                 message_row(
                                     ui,
                                     &frame.message,
+                                    frame.analysis.as_ref(),
                                     frame.origin,
                                     selected_index == Some(source_index),
                                     row,
@@ -706,7 +713,7 @@ fn io_assembly_controls(ui: &mut egui::Ui, selection: &mut IoAssemblySelection) 
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    RichText::new("DEVICE I/O ASSEMBLY")
+                    RichText::new("I/O ASSEMBLY MAPPING")
                         .size(10.5)
                         .color(MUTED)
                         .strong(),
@@ -722,14 +729,14 @@ fn io_assembly_controls(ui: &mut egui::Ui, selection: &mut IoAssemblySelection) 
             });
             ui.label(
                 RichText::new(
-                    "No implicit EDS scaling · Counts conversion requires device Data Units and Full Scale",
+                    "Select each direction once; the mapping is saved locally and reused for later traces",
                 )
                 .size(10.5)
                 .color(MUTED),
             );
             ui.label(
                 RichText::new(
-                    "Connection order selects the INT/REAL family · Mixed selections are decoded independently with a warning",
+                    "No implicit EDS scaling · Counts conversion requires device Data Units and Full Scale",
                 )
                 .size(10.5)
                 .color(MUTED),
@@ -871,13 +878,14 @@ fn table_header(ui: &mut egui::Ui, width: f32) {
         .inner_margin(egui::Margin::symmetric(0, 2))
         .show(ui, |ui| {
             let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 26.0), Sense::hover());
-            paint_message_columns(ui, rect, None, None, MUTED);
+            paint_message_columns(ui, rect, None, None, None, MUTED);
         });
 }
 
 fn message_row(
     ui: &mut egui::Ui,
     message: &TraceMessage,
+    analysis: Option<&FrameAnalysis>,
     origin: FrameOrigin,
     selected: bool,
     row: usize,
@@ -930,7 +938,14 @@ fn message_row(
     } else {
         BLUE
     };
-    paint_message_columns(ui, rect, Some(message), Some(origin), direction_color);
+    paint_message_columns(
+        ui,
+        rect,
+        Some(message),
+        analysis,
+        Some(origin),
+        direction_color,
+    );
     let clicked = response.clicked();
     if clicked {
         response.request_focus();
@@ -943,6 +958,7 @@ fn paint_message_columns(
     ui: &egui::Ui,
     rect: egui::Rect,
     message: Option<&TraceMessage>,
+    analysis: Option<&FrameAnalysis>,
     origin: Option<FrameOrigin>,
     direction_color: Color32,
 ) {
@@ -1034,6 +1050,23 @@ fn paint_message_columns(
             Some(FrameOrigin::File) => MUTED,
             None => MUTED,
         },
+    );
+    let meaning = analysis.map_or_else(
+        || {
+            if message.is_some() {
+                String::new()
+            } else {
+                "Meaning".into()
+            }
+        },
+        analysis_summary_label,
+    );
+    painter.text(
+        Pos2::new(x + 650.0, y),
+        Align2::LEFT_CENTER,
+        meaning,
+        FontId::new(11.0, FontFamily::Proportional),
+        analysis.map_or(MUTED, analysis_color),
     );
 }
 
@@ -1233,24 +1266,176 @@ fn data_decoder_panel(
             .strong(),
     );
     ui.add_space(7.0);
+    if let Some(subject) = analysis.subject {
+        semantic_subject_card(ui, subject, analysis_color(analysis));
+        ui.add_space(10.0);
+    }
+
+    let values = analysis
+        .fields
+        .iter()
+        .filter(|field| field.role == DecodedFieldRole::Value)
+        .collect::<Vec<_>>();
+    let context = analysis
+        .fields
+        .iter()
+        .filter(|field| {
+            field.role != DecodedFieldRole::Value
+                && (analysis.subject.is_none() || field.role != DecodedFieldRole::Target)
+        })
+        .collect::<Vec<_>>();
+
+    if !values.is_empty() {
+        section_label(ui, "PARSED VALUES");
+        ui.add_space(6.0);
+        decoded_field_card(ui, ("decoded_values", source_index), &values, true);
+    }
+    if !context.is_empty() {
+        if !values.is_empty() {
+            ui.add_space(9.0);
+        }
+        egui::CollapsingHeader::new(if analysis.subject.is_some() {
+            "Protocol and correlation details"
+        } else {
+            "Decoded fields"
+        })
+        .id_salt(("decoded_context", source_index))
+        .default_open(values.is_empty())
+        .show(ui, |ui| {
+            decoded_field_card(
+                ui,
+                ("decoded_context_fields", source_index),
+                &context,
+                false,
+            );
+        });
+    }
+
+    if !analysis.warnings.is_empty() {
+        ui.add_space(9.0);
+        for warning in &analysis.warnings {
+            alert(ui, &format!("Warning: {warning}"), AMBER);
+        }
+    }
+}
+
+fn analysis_summary_label(analysis: &FrameAnalysis) -> String {
+    match analysis.subject {
+        Some(AnalysisSubject::Explicit(subject)) => format!(
+            "{} · {} / {}",
+            subject.operation.label(),
+            subject.instance_name,
+            subject.attribute_name
+        ),
+        Some(AnalysisSubject::IoAssembly(subject)) => format!(
+            "{} Assembly {} · {}",
+            subject.direction.label(),
+            subject.number,
+            subject.name
+        ),
+        None => humanize_service_text(&analysis.title),
+    }
+}
+
+fn semantic_subject_card(ui: &mut egui::Ui, subject: AnalysisSubject, color: Color32) {
     egui::Frame::new()
-        .fill(PANEL)
+        .fill(color.gamma_multiply(0.09))
+        .stroke(Stroke::new(1.0, color.gamma_multiply(0.55)))
+        .corner_radius(10.0)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            match subject {
+                AnalysisSubject::Explicit(subject) => {
+                    ui.horizontal_wrapped(|ui| {
+                        chip(ui, subject.operation.label(), color);
+                        chip(
+                            ui,
+                            if subject.writable {
+                                "GET / SET"
+                            } else {
+                                "GET only"
+                            },
+                            if subject.writable { ACCENT } else { MUTED },
+                        );
+                        chip(ui, subject.data_type, BLUE);
+                    });
+                    ui.add_space(7.0);
+                    ui.label(
+                        RichText::new(subject.target_label())
+                            .size(18.0)
+                            .color(TEXT)
+                            .strong(),
+                    );
+                    ui.label(RichText::new(subject.object_name).size(11.0).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(subject.address_label())
+                            .size(11.5)
+                            .color(color)
+                            .monospace(),
+                    );
+                }
+                AnalysisSubject::IoAssembly(subject) => {
+                    let direction_color = match subject.direction {
+                        devicenet_identifier_analyzer::IoAssemblyDirection::Input => BLUE,
+                        devicenet_identifier_analyzer::IoAssemblyDirection::Output => ACCENT,
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        chip(ui, subject.direction.label(), direction_color);
+                        chip(ui, &format!("Instance {}", subject.number), color);
+                        chip(ui, &format!("{} bytes", subject.byte_len), MUTED);
+                    });
+                    ui.add_space(7.0);
+                    ui.label(RichText::new(subject.name).size(18.0).color(TEXT).strong());
+                    ui.label(RichText::new(subject.profile).size(11.0).color(MUTED));
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(match subject.direction {
+                            devicenet_identifier_analyzer::IoAssemblyDirection::Input => {
+                                "Device → host · decoded with the selected Input instance"
+                            }
+                            devicenet_identifier_analyzer::IoAssemblyDirection::Output => {
+                                "Host → device · decoded with the selected Output instance"
+                            }
+                        })
+                        .size(11.5)
+                        .color(direction_color),
+                    );
+                }
+            }
+        });
+}
+
+fn decoded_field_card(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    fields: &[&DecodedField],
+    prominent: bool,
+) {
+    egui::Frame::new()
+        .fill(if prominent { SURFACE } else { PANEL })
         .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(8.0)
+        .corner_radius(9.0)
         .inner_margin(12.0)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            egui::Grid::new(("decoded_fields", source_index))
+            egui::Grid::new(id)
                 .num_columns(2)
-                .min_col_width(112.0)
-                .spacing([14.0, 8.0])
-                .striped(true)
+                .min_col_width(126.0)
+                .spacing([16.0, if prominent { 12.0 } else { 8.0 }])
+                .striped(!prominent)
                 .show(ui, |ui| {
-                    for field in &analysis.fields {
+                    for field in fields {
                         let service_code = field.service_code;
                         let name_response = ui.add(
-                            egui::Label::new(RichText::new(&field.name).size(11.0).color(MUTED))
-                                .wrap(),
+                            egui::Label::new(
+                                RichText::new(&field.name)
+                                    .size(if prominent { 11.5 } else { 11.0 })
+                                    .color(if prominent { BLUE } else { MUTED })
+                                    .strong(),
+                            )
+                            .wrap(),
                         );
                         let display_value = if service_code.is_some() {
                             humanize_service_text(&field.value)
@@ -1264,24 +1449,21 @@ fn data_decoder_panel(
                                         let response = ui.add(
                                             egui::Label::new(
                                                 RichText::new(display_value)
-                                                    .size(12.0)
+                                                    .size(if prominent { 16.0 } else { 12.0 })
                                                     .color(TEXT)
-                                                    .monospace(),
+                                                    .monospace()
+                                                    .strong(),
                                             )
                                             .wrap(),
                                         );
                                         if let Some(unit) = &field.unit {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(unit).size(11.0).color(MUTED),
-                                                )
-                                                .wrap(),
-                                            );
+                                            chip(ui, unit, ACCENT);
                                         }
                                         response
                                     })
                                     .inner;
                                 if let Some(description) = &field.description {
+                                    ui.add_space(2.0);
                                     ui.add(
                                         egui::Label::new(
                                             RichText::new(description).size(11.0).color(MUTED),
@@ -1300,13 +1482,6 @@ fn data_decoder_panel(
                     }
                 });
         });
-
-    if !analysis.warnings.is_empty() {
-        ui.add_space(9.0);
-        for warning in &analysis.warnings {
-            alert(ui, &format!("Warning: {warning}"), AMBER);
-        }
-    }
 }
 
 fn humanize_service_text(value: &str) -> String {

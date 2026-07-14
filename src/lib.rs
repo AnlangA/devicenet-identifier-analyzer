@@ -9,11 +9,15 @@ mod explicit;
 mod group2;
 mod mfc_explicit;
 mod path;
+mod profile;
 mod protocol;
 mod services;
 mod status;
 
-pub use analysis::DecodedField;
+pub use analysis::{
+    AnalysisSubject, DecodedField, DecodedFieldRole, ExplicitOperation, ExplicitSubject,
+    IoAssemblySubject,
+};
 pub use assembly::{
     INPUT_ASSEMBLIES, IoAssemblyDirection, IoAssemblyInstance, IoAssemblyNumericFormat,
     OUTPUT_ASSEMBLIES,

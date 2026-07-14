@@ -57,7 +57,7 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 - Manual CAN ID/data entry with an optional millisecond timestamp and derived DLC
 - AI structured array import through `zai-rs 0.6.0`, `glm-5-turbo`, and Function Calling
 - Compact endpoint selector for Standard URL, Coding Plan URL, or a user-entered Base URL
-- API keys remain in memory only
+- AI endpoint settings are persisted locally; API keys are encrypted before eframe storage
 - Plain-text export of only the frames created manually or through AI
 
 The message decoder is checked against DeviceNet Volume 3 Edition 1.16 and the CIP common
@@ -100,7 +100,9 @@ the complete entry window scrolls on smaller displays.
 When a trace contains I/O-capable messages, the message browser shows Input and Output
 Assembly selectors. Host MAC ID defaults to `0`: data produced by the host is decoded with the
 selected Output instance, while data produced by another node is decoded with the selected
-Input instance. The engineering unit itself is configured in the mapped CIP object and is not
+Input instance. The selection is stored locally and reused when later traces are opened, so each
+direction normally needs to be configured only once. The engineering unit itself is configured
+in the mapped CIP object and is not
 carried in these I/O payloads, so the decoder reports the applicable unit context without
 inventing a device-specific scale or unit. Multi-byte `INT` values are signed 16-bit
 two's-complement and `REAL` values are IEEE-754 binary32, both little-endian. No implicit
@@ -151,20 +153,30 @@ unit is unknown, required scaling context is absent, or an attribute is outside 
 small profile/device-table subset, the analyzer keeps the original attribute/service bytes and
 does not guess a conversion.
 
+The inspector presents these results semantically instead of as one flat protocol table. Explicit
+frames show the operation, instance name, attribute name, class/instance/attribute address, access
+mode, and table data type in a highlighted target card; typed values, units, and descriptions are
+shown separately from collapsible transport/correlation details. I/O frames show the selected
+Input/Output Assembly name and direction before their decoded components. The message browser also
+includes the resolved operation or Assembly meaning, making related frames recognizable without
+opening every row.
+
 ## Architecture
 
 - `src/lib.rs`: trace parsing and 11-bit DeviceNet identifier model
-- `src/analysis.rs`: shared typed decoded-field presentation model
+- `src/analysis.rs`: shared semantic subject and typed decoded-field presentation model
 - `src/assembly.rs`: Volume 1 Sections 6-29/6-39 I/O Assembly metadata and component decoder
 - `src/explicit.rs`: shared Explicit Message header, body-format, and fragmentation primitives
 - `src/path.rs`: shared Packed EPATH logical-segment decoding
+- `src/profile.rs`: single source of truth for Explicit object, instance, attribute, type, and access metadata
 - `src/status.rs`: complete CIP General Status metadata from Volume 1 Appendix B
 - `src/group2.rs`: stateful predefined Group 2 Only protocol decoder
 - `src/protocol.rs`: unified Group 1-4, UCMM, dynamic connection, and Offline Connection Set decoder
 - `src/services.rs`: CIP common Service Code metadata and service-data decoder
-- `src/mfc_explicit.rs`: profile-scoped MFC/EMFC Explicit attribute metadata, state, and
-  numeric/unit interpretation
-- `src/app.rs`: document, selection, sort, filter, and derived-statistics state
+- `src/mfc_explicit.rs`: profile-scoped MFC/EMFC Explicit state and numeric/unit interpretation
+- `src/document.rs`: analyzed trace document, statistics, and search-index pipeline
+- `src/app.rs`: transient selection, navigation, filter, and job state
+- `src/settings.rs`: persisted AI and I/O Assembly settings
 - `src/frame_input.rs`: manual frame validation, source tracking, and text export
 - `src/ai_import.rs`: optimized extraction prompt and Z.ai Function Calling client
 - `src/ui.rs`: egui presentation and interaction layer

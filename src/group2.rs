@@ -3,7 +3,7 @@ use crate::mfc_explicit::{AttributeDecode, DeviceKey, MfcExplicitState, PendingA
 use crate::path::decode_logical_path;
 use crate::services::{decode_common_service_data, service_name};
 use crate::status::general_status_name;
-use crate::{DecodedField, TraceMessage, compare_optional_time};
+use crate::{AnalysisSubject, DecodedField, TraceMessage, compare_optional_time};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,7 @@ impl Group2Function {
 pub struct Group2Analysis {
     pub function: Group2Function,
     pub title: String,
+    pub subject: Option<AnalysisSubject>,
     pub fields: Vec<DecodedField>,
     pub warnings: Vec<String>,
 }
@@ -48,6 +49,7 @@ impl Group2Analysis {
         Self {
             function,
             title: title.into(),
+            subject: None,
             fields: Vec::new(),
             warnings: Vec::new(),
         }
@@ -103,6 +105,7 @@ struct RequestContext {
     class_id: Option<u32>,
     instance_id: Option<u32>,
     attribute_id: Option<u32>,
+    subject: Option<AnalysisSubject>,
     pending_attribute_update: Option<PendingAttributeUpdate>,
     kind: RequestKind,
 }
@@ -662,6 +665,7 @@ impl Group2Decoder {
                     class_id: address.class_id,
                     instance_id: address.instance_id,
                     attribute_id,
+                    subject: analysis.subject,
                     pending_attribute_update,
                     kind: request_kind,
                 },
@@ -698,6 +702,11 @@ impl Group2Decoder {
         let response_matches_request = request
             .as_ref()
             .is_some_and(|request| request.service_code == service_code);
+        if (response_matches_request || service_code == 0x14)
+            && let Some(request) = &request
+        {
+            analysis.subject = request.subject;
+        }
         if state_valid && (response_matches_request || service_code == 0x14) {
             self.requests.remove(&key);
         }
@@ -1138,7 +1147,11 @@ fn append_attribute_decode(
         fields,
         warnings,
         pending_update,
+        subject,
     } = decoded;
+    if subject.is_some() {
+        analysis.subject = subject;
+    }
     analysis.fields.extend(fields);
     analysis.warnings.extend(warnings);
     pending_update
@@ -1421,12 +1434,12 @@ mod tests {
 
         assert_eq!(
             decoded[2].as_ref().unwrap().field("Read target"),
-            Some("Identity instance 1 / Vendor ID")
+            Some("Device identity / Vendor ID (Class 0x01, Instance 1, Attribute 0x01)")
         );
         assert_eq!(response.field("Service data"), Some("15 07"));
         assert_eq!(
             response.field("Read target"),
-            Some("Identity instance 1 / Vendor ID")
+            Some("Device identity / Vendor ID (Class 0x01, Instance 1, Attribute 0x01)")
         );
         assert!(
             response
@@ -1479,10 +1492,17 @@ mod tests {
 
         assert_eq!(
             decoded[4].as_ref().unwrap().field("Write target"),
-            Some("S-Analog Sensor instance 1 / Data type")
+            Some("Flow sensor / Data type (Class 0x31, Instance 1, Attribute 0x03)")
         );
         assert_eq!(decoded[7].as_ref().unwrap().field("Flow"), Some("7"));
         assert_eq!(decoded[11].as_ref().unwrap().field("Flow"), Some("12.5"));
+        assert!(matches!(
+            decoded[9].as_ref().unwrap().subject,
+            Some(AnalysisSubject::Explicit(subject))
+                if subject.operation == crate::ExplicitOperation::Write
+                    && subject.instance_name == "Flow sensor"
+                    && subject.attribute_name == "Data type"
+        ));
     }
 
     #[test]
