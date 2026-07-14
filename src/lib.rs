@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 use std::fmt;
 
 mod analysis;
+mod assembly;
 mod explicit;
 mod group2;
 mod path;
@@ -12,13 +13,20 @@ mod services;
 mod status;
 
 pub use analysis::DecodedField;
+pub use assembly::{
+    INPUT_ASSEMBLIES, IoAssemblyDirection, IoAssemblyInstance, IoAssemblyNumericFormat,
+    OUTPUT_ASSEMBLIES,
+};
 pub use explicit::MessageBodyFormat;
 #[allow(deprecated)]
 pub use group2::{
     Group2Analysis, Group2Function, decode_group2_trace, decode_group2_trace_ordered,
 };
 #[allow(deprecated)]
-pub use protocol::{FrameAnalysis, FrameFunction, decode_trace, decode_trace_ordered};
+pub use protocol::{
+    DEFAULT_HOST_MAC_ID, FrameAnalysis, FrameFunction, IoAssemblySelection, decode_trace,
+    decode_trace_ordered, decode_trace_ordered_with_io,
+};
 pub use services::{service_description, service_name};
 
 pub const MAX_STANDARD_IDENTIFIER: u16 = 0x7ff;

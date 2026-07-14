@@ -28,12 +28,20 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 - Stateful UCMM Open correlation that learns dynamic Group 1/2/3 Explicit Connection IDs
 - Dynamic Group 2 connections take precedence over the fixed Section 3-7 mapping without
   contaminating the predefined Group 2 state machine
+- Selectable Input and Output I/O Assembly decoding for the Volume 1 Section 6-29 Mass Flow
+  Controller and Section 6-39 Enhanced Mass Flow Controller profiles
+- GT-1000-D EDS vendor Assemblies `0x97` (Flow/Valve/Temperature) and `0x98`
+  (Override/Valve), with device-specific Counts full-scale context
+- Assembly component values include their CIP type, device-configured engineering-unit
+  context, and mapped object/attribute description
+- Unacknowledged DeviceNet I/O fragment reassembly for selected Assembly instances larger
+  than eight bytes
 - Connected Explicit request/response, fragmentation, object address, and request correlation
   across every learned Message Group
 - All CIP common Service Codes from Volume 1 Appendix A, including fixed request/response
   parameter layouts and reserved/object-specific/vendor-specific range classification
 - Group 4 Offline Ownership, Identify, Who, and Change MAC ID field decoding and validation
-- Raw application data for Bit-Strobe, Multicast Poll, COS/Cyclic, and Poll I/O
+- Raw application data retained alongside optional Assembly decoding for supported I/O profiles
 - Manual CAN ID/data entry with an optional millisecond timestamp and derived DLC
 - AI structured array import through `zai-rs 0.6.0`, `glm-5-turbo`, and Function Calling
 - Compact endpoint selector for Standard URL, Coding Plan URL, or a user-entered Base URL
@@ -43,8 +51,8 @@ message, and decodes the selected DeviceNet frame across Message Groups 1-4.
 The message decoder is checked against DeviceNet Volume 3 Edition 1.16 and the CIP common
 service definitions in Volume 1 Edition 3.37. In particular, Volume 3 Section 3-7 identifier
 roles and mappings have dedicated regression tests. I/O payloads and object/class-specific
-service tails remain raw when their layouts are not defined by the identifier mapping or common
-service specification.
+service tails remain raw when their layouts are not selected from the supported Volume 1
+profiles or defined by the common service specification.
 
 ## Run
 
@@ -73,10 +81,35 @@ integers, validates DLC against the byte count, and never invents missing frame
 content. The AI input editor has a fixed viewport with internal scrolling, and
 the complete entry window scrolls on smaller displays.
 
+When a trace contains I/O-capable messages, the message browser shows Input and Output
+Assembly selectors. Host MAC ID defaults to `0`: data produced by the host is decoded with the
+selected Output instance, while data produced by another node is decoded with the selected
+Input instance. The engineering unit itself is configured in the mapped CIP object and is not
+carried in these I/O payloads, so the decoder reports the applicable unit context without
+inventing a device-specific scale or unit. Multi-byte `INT` values are signed 16-bit
+two's-complement and `REAL` values are IEEE-754 binary32, both little-endian. No implicit
+multiplier, divider, base, or offset is applied: converting Counts requires the device's active
+Data Units and Full Scale configuration.
+
+The profile uses the first successfully established I/O connection to select the INT or REAL
+numeric family. A trace may not contain the connection-establishment order, so mixed Input/Output
+selections are decoded independently and reported with a warning instead of suppressing the valid
+direction. Status/exception-only instances are neutral.
+
+DeviceNet EDS `[IO_Info]` entries describe a connection's total size, compatibility mask,
+display name, and Assembly path; they do not define member boundaries, numeric types, units, or
+scaling. Vendor-specific Assembly names therefore remain insufficient evidence for a typed
+conversion unless a separate manufacturer schema defines their members.
+
+All selectable mappings in this analyzer are fixed-size static Assemblies. Their table/EDS total
+size is therefore the selected Produced/Consumed Connection Size used to decide whether the
+DeviceNet unacknowledged I/O fragmentation protocol is present.
+
 ## Architecture
 
 - `src/lib.rs`: trace parsing and 11-bit DeviceNet identifier model
 - `src/analysis.rs`: shared typed decoded-field presentation model
+- `src/assembly.rs`: Volume 1 Sections 6-29/6-39 I/O Assembly metadata and component decoder
 - `src/explicit.rs`: shared Explicit Message header, body-format, and fragmentation primitives
 - `src/path.rs`: shared Packed EPATH logical-segment decoding
 - `src/status.rs`: complete CIP General Status metadata from Volume 1 Appendix B
@@ -97,7 +130,9 @@ in one `AnalyzedFrame`, eliminating parallel-vector indexing invariants.
 Use the unified `decode_trace_ordered` library API when UCMM-allocated Group 2
 connections may be present. The standalone Group 2 decoder intentionally has no
 UCMM connection context, and map-based compatibility APIs are lossy when display
-frame numbers repeat.
+frame numbers repeat. Use `decode_trace_ordered_with_io` with an
+`IoAssemblySelection` to apply the Section 6-29/6-39 Assembly mapping and I/O
+fragment reassembly.
 
 ## Supported single-frame input formats
 

@@ -1,5 +1,6 @@
 //! Unified DeviceNet Message Group 1-4 decoder.
 
+use crate::assembly::{IoAssemblyDirection, assembly_instance, decode_assembly};
 use crate::explicit::{ExplicitHeader, FragmentKind, MessageBodyFormat, fragment_ack_status};
 use crate::group2::{Group2Analysis, Group2Decoder, Group2Function};
 use crate::path::decode_logical_path;
@@ -36,11 +37,13 @@ impl FrameFunction {
     pub fn label(self) -> &'static str {
         match self {
             Self::Group1Connection => "Group 1 Connection Message",
-            Self::Group1IoMulticastPollResponse => "Device I/O Multicast Poll Response",
-            Self::Group1IoChangeOfStateOrCyclic => "Device I/O Change of State/Cyclic Message",
-            Self::Group1IoBitStrobeResponse => "Device I/O Bit-Strobe Response",
+            Self::Group1IoMulticastPollResponse => {
+                "Predefined-set I/O Multicast Poll Response role"
+            }
+            Self::Group1IoChangeOfStateOrCyclic => "Predefined-set I/O Change of State/Cyclic role",
+            Self::Group1IoBitStrobeResponse => "Predefined-set I/O Bit-Strobe Response role",
             Self::Group1IoPollResponseOrChangeOfStateAck => {
-                "Device I/O Poll Response or Change of State/Cyclic Acknowledge"
+                "Predefined-set I/O Poll Response or Change of State/Cyclic Acknowledge role"
             }
             Self::Group2(function) => function.label(),
             Self::ConnectedExplicitRequest => "Connected Explicit Request",
@@ -72,6 +75,82 @@ impl FrameFunction {
                 )
         )
     }
+
+    pub fn is_io(self) -> bool {
+        matches!(
+            self,
+            Self::Group1IoMulticastPollResponse
+                | Self::Group1IoChangeOfStateOrCyclic
+                | Self::Group1IoBitStrobeResponse
+                | Self::Group1IoPollResponseOrChangeOfStateAck
+                | Self::Group2(
+                    Group2Function::IoBitStrobeCommand
+                        | Group2Function::IoMulticastPollCommand
+                        | Group2Function::ChangeOfStateOrCyclicAck
+                        | Group2Function::IoPollOrChangeOfStateOrCyclic
+                )
+        )
+    }
+
+    /// Returns whether this predefined identifier function can carry an
+    /// application Assembly payload. Protocol-only I/O commands/acknowledgments
+    /// and context-free Group 1 connection IDs are intentionally excluded.
+    pub fn has_io_assembly_payload(self) -> bool {
+        matches!(
+            self,
+            Self::Group1IoMulticastPollResponse
+                | Self::Group1IoChangeOfStateOrCyclic
+                | Self::Group1IoBitStrobeResponse
+                | Self::Group1IoPollResponseOrChangeOfStateAck
+                | Self::Group2(
+                    Group2Function::IoMulticastPollCommand
+                        | Group2Function::IoPollOrChangeOfStateOrCyclic
+                )
+        )
+    }
+}
+
+pub const DEFAULT_HOST_MAC_ID: u8 = 0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoAssemblySelection {
+    pub host_mac_id: u8,
+    pub input_instance: Option<u8>,
+    pub output_instance: Option<u8>,
+}
+
+impl IoAssemblySelection {
+    fn instance_for(self, direction: IoAssemblyDirection) -> Option<u8> {
+        match direction {
+            IoAssemblyDirection::Input => self.input_instance,
+            IoAssemblyDirection::Output => self.output_instance,
+        }
+    }
+
+    fn formats_are_compatible(self) -> bool {
+        let input = self
+            .input_instance
+            .and_then(|number| assembly_instance(IoAssemblyDirection::Input, number));
+        let output = self
+            .output_instance
+            .and_then(|number| assembly_instance(IoAssemblyDirection::Output, number));
+        match (input, output) {
+            (Some(input), Some(output)) => input
+                .numeric_format()
+                .is_compatible_with(output.numeric_format()),
+            _ => true,
+        }
+    }
+}
+
+impl Default for IoAssemblySelection {
+    fn default() -> Self {
+        Self {
+            host_mac_id: DEFAULT_HOST_MAC_ID,
+            input_instance: None,
+            output_instance: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +179,17 @@ impl FrameAnalysis {
 
     fn push_service(&mut self, name: impl Into<String>, code: u8, value: impl Into<String>) {
         self.fields.push(DecodedField::service(name, code, value));
+    }
+
+    fn push_detailed(
+        &mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+        unit: impl Into<String>,
+        description: impl Into<String>,
+    ) {
+        self.fields
+            .push(DecodedField::detailed(name, value, unit, description));
     }
 
     pub fn field(&self, name: &str) -> Option<&str> {
@@ -147,6 +237,21 @@ pub fn decode_trace(messages: &[TraceMessage]) -> HashMap<u64, FrameAnalysis> {
 
 /// Decode all DeviceNet groups while retaining one result slot per source frame.
 pub fn decode_trace_ordered(messages: &[TraceMessage]) -> Vec<Option<FrameAnalysis>> {
+    decode_trace_ordered_with_config(messages, None)
+}
+
+/// Decode all DeviceNet groups and apply the selected Volume 1 I/O Assembly mapping.
+pub fn decode_trace_ordered_with_io(
+    messages: &[TraceMessage],
+    selection: IoAssemblySelection,
+) -> Vec<Option<FrameAnalysis>> {
+    decode_trace_ordered_with_config(messages, Some(selection))
+}
+
+fn decode_trace_ordered_with_config(
+    messages: &[TraceMessage],
+    io_assembly: Option<IoAssemblySelection>,
+) -> Vec<Option<FrameAnalysis>> {
     let mut ordered = messages.iter().enumerate().collect::<Vec<_>>();
     ordered.sort_by(|(left_index, left), (right_index, right)| {
         compare_optional_time(left.time_offset_ms, right.time_offset_ms)
@@ -154,7 +259,10 @@ pub fn decode_trace_ordered(messages: &[TraceMessage]) -> Vec<Option<FrameAnalys
             .then_with(|| left_index.cmp(right_index))
     });
 
-    let mut decoder = ProtocolDecoder::default();
+    let mut decoder = ProtocolDecoder {
+        io_assembly,
+        ..ProtocolDecoder::default()
+    };
     let mut results = vec![None; messages.len()];
     for (source_index, message) in ordered {
         results[source_index] = decoder.decode(message);
@@ -231,6 +339,21 @@ struct FragmentState {
     body: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IoFragmentKey {
+    bus: u32,
+    identifier: u32,
+    instance: u8,
+    direction: IoAssemblyDirection,
+}
+
+#[derive(Debug, Clone)]
+struct IoFragmentState {
+    first_frame: u64,
+    last_count: u8,
+    payload: Vec<u8>,
+}
+
 #[derive(Default)]
 struct ProtocolDecoder {
     group2: Group2Decoder,
@@ -239,6 +362,8 @@ struct ProtocolDecoder {
     pending_closes: HashMap<UcmmKey, (u16, u64)>,
     requests: HashMap<ExplicitRequestKey, ExplicitRequestContext>,
     fragments: HashMap<FragmentKey, FragmentState>,
+    io_assembly: Option<IoAssemblySelection>,
+    io_fragments: HashMap<IoFragmentKey, IoFragmentState>,
 }
 
 impl ProtocolDecoder {
@@ -256,7 +381,7 @@ impl ProtocolDecoder {
             }
         }
 
-        match decoded.fields {
+        let analysis = match decoded.fields {
             IdentifierFields::Group1 {
                 message_id,
                 source_mac_id,
@@ -310,7 +435,296 @@ impl ProtocolDecoder {
                     .push("0x7F0-0x7FF is the invalid Identifier range".into());
                 Some(analysis)
             }
+        };
+        analysis.map(|analysis| self.attach_io_assembly(message, decoded.fields, analysis))
+    }
+
+    fn attach_io_assembly(
+        &mut self,
+        message: &TraceMessage,
+        identifier: IdentifierFields,
+        mut analysis: FrameAnalysis,
+    ) -> FrameAnalysis {
+        let Some(selection) = self.io_assembly else {
+            return analysis;
+        };
+        if !analysis.function.has_io_assembly_payload() {
+            return analysis;
         }
+        if selection.host_mac_id > 63 {
+            analysis.warnings.push(format!(
+                "Host MAC ID {} is outside the DeviceNet range 0-63; Assembly mapping was skipped",
+                selection.host_mac_id
+            ));
+            return analysis;
+        }
+        if !selection.formats_are_compatible() {
+            analysis.warnings.push(
+                "Selected Input and Output Assemblies mix INT and REAL numeric families. Volume 1 uses the first successfully established I/O connection to select the family; because a trace does not prove that connection order, the selected direction is decoded independently"
+                    .into(),
+            );
+        }
+        let Some((direction, direction_basis)) = io_payload_direction(
+            analysis.function,
+            identifier,
+            message,
+            selection.host_mac_id,
+        ) else {
+            analysis.push(
+                "Assembly mapping",
+                "No selectable Assembly payload is present in this I/O message",
+            );
+            if matches!(
+                analysis.function,
+                FrameFunction::Group2(Group2Function::IoPollOrChangeOfStateOrCyclic)
+            ) {
+                analysis.warnings.push(
+                    "Group 2 Message ID 5 can carry either a controller command or a device message; use a Tx/Rx capture direction to establish the producer"
+                        .into(),
+                );
+            } else if matches!(
+                (analysis.function, identifier),
+                (
+                    FrameFunction::Group1IoMulticastPollResponse
+                        | FrameFunction::Group1IoChangeOfStateOrCyclic
+                        | FrameFunction::Group1IoBitStrobeResponse
+                        | FrameFunction::Group1IoPollResponseOrChangeOfStateAck,
+                    IdentifierFields::Group1 { source_mac_id, .. }
+                ) if source_mac_id == selection.host_mac_id
+            ) {
+                analysis.warnings.push(
+                    "Predefined Group 1 I/O messages are device-produced, but the Source MAC ID equals the configured host; Assembly mapping was skipped"
+                        .into(),
+                );
+            }
+            return analysis;
+        };
+        analysis.push(
+            "I/O direction",
+            match direction {
+                IoAssemblyDirection::Input => "Input - device to host",
+                IoAssemblyDirection::Output => "Output - host to device",
+            },
+        );
+        analysis.push("Direction basis", direction_basis);
+        let Some(instance_number) = selection.instance_for(direction) else {
+            analysis.push("Assembly instance", "Not selected - raw I/O data retained");
+            return analysis;
+        };
+        let Some(instance) = assembly_instance(direction, instance_number) else {
+            analysis.warnings.push(format!(
+                "Instance {instance_number} is not a supported Volume 1 6-29/6-39 or GT-1000-D EDS {} Assembly",
+                direction.label()
+            ));
+            return analysis;
+        };
+        analysis.push(
+            "Assembly instance",
+            format!(
+                "{} (0x{:02X}) - {}",
+                instance.number, instance.number, instance.name
+            ),
+        );
+        analysis.push("Assembly profile", instance.profile);
+        analysis.push("Support declaration", instance.requirements);
+        if instance.requirements.contains("(N)") {
+            analysis.push(
+                "Requirement note",
+                "N means optional, not unsupported; actual supported instances are declared by the device manufacturer",
+            );
+        }
+        analysis.push(
+            "Selected I/O connection size",
+            format!("{} bytes", instance.byte_len),
+        );
+
+        if analysis.function == FrameFunction::Group1IoBitStrobeResponse && instance.byte_len > 8 {
+            analysis.warnings.push(format!(
+                "Bit-Strobe Response data cannot carry the {}-byte selected Assembly; mapping was skipped",
+                instance.byte_len
+            ));
+            return analysis;
+        }
+
+        // Every supported profile/EDS entry is a fixed static mapping whose
+        // declared total I/O size is also its Produced/Consumed Connection
+        // Size. That connection size, rather than an observed DLC, selects
+        // the unacknowledged I/O fragmentation protocol.
+        if instance.byte_len > 8 {
+            self.decode_fragmented_io(message, direction, instance_number, analysis)
+        } else {
+            self.append_assembly_payload(direction, instance_number, &message.data, analysis)
+        }
+    }
+
+    fn decode_fragmented_io(
+        &mut self,
+        message: &TraceMessage,
+        direction: IoAssemblyDirection,
+        instance: u8,
+        mut analysis: FrameAnalysis,
+    ) -> FrameAnalysis {
+        let Some(protocol) = message.data.first().copied() else {
+            analysis
+                .warnings
+                .push("Missing I/O Fragmentation Protocol byte".into());
+            return analysis;
+        };
+        let fragment_type = protocol >> 6;
+        let fragment_count = protocol & 0x3f;
+        let fragment_name = match fragment_type {
+            0 => "First",
+            1 => "Middle",
+            2 => "Last",
+            _ => "Acknowledge (invalid for I/O)",
+        };
+        analysis.push("I/O fragment type", fragment_name);
+        analysis.push("I/O fragment count", fragment_count.to_string());
+        let fragment_data = message.data.get(1..).unwrap_or_default();
+        let key = IoFragmentKey {
+            bus: message.bus,
+            identifier: message.identifier,
+            instance,
+            direction,
+        };
+        const MAX_IO_REASSEMBLY_BYTES: usize = 7 * 64;
+        if fragment_data.len() > MAX_IO_REASSEMBLY_BYTES {
+            self.io_fragments.remove(&key);
+            analysis.warnings.push(format!(
+                "I/O fragment data exceeds the protocol-sized safety limit ({} > {MAX_IO_REASSEMBLY_BYTES} bytes); transfer discarded",
+                fragment_data.len()
+            ));
+            return analysis;
+        }
+        analysis.push("I/O fragment data", hex_bytes(fragment_data));
+
+        match (fragment_type, fragment_count) {
+            (0, 0x3f) => {
+                self.io_fragments.remove(&key);
+                analysis.push("Reassembled I/O data", hex_bytes(fragment_data));
+                self.append_assembly_payload(direction, instance, fragment_data, analysis)
+            }
+            (0, 0) => {
+                if self
+                    .io_fragments
+                    .insert(
+                        key,
+                        IoFragmentState {
+                            first_frame: message.number,
+                            last_count: 0,
+                            payload: fragment_data.to_vec(),
+                        },
+                    )
+                    .is_some()
+                {
+                    analysis
+                        .warnings
+                        .push("A new first I/O fragment replaced an incomplete series".into());
+                }
+                analysis.push("Assembly decode", "Waiting for remaining I/O fragments");
+                analysis
+            }
+            (1 | 2, _) => {
+                let Some(previous_count) =
+                    self.io_fragments.get(&key).map(|state| state.last_count)
+                else {
+                    analysis
+                        .warnings
+                        .push("I/O fragment received before a first fragment".into());
+                    return analysis;
+                };
+                if previous_count == 0x3f {
+                    self.io_fragments.remove(&key);
+                    analysis.warnings.push(
+                        "I/O fragment count cannot advance beyond the 6-bit value 0x3F; reassembly reset"
+                            .into(),
+                    );
+                    return analysis;
+                }
+                let expected = previous_count + 1;
+                if fragment_count != expected {
+                    self.io_fragments.remove(&key);
+                    analysis.warnings.push(format!(
+                        "Expected I/O fragment count {expected}, received {fragment_count}; reassembly reset"
+                    ));
+                    return analysis;
+                }
+                let state = self
+                    .io_fragments
+                    .get_mut(&key)
+                    .expect("fragment state was checked above");
+                if state.payload.len().saturating_add(fragment_data.len()) > MAX_IO_REASSEMBLY_BYTES
+                {
+                    let received = state.payload.len().saturating_add(fragment_data.len());
+                    self.io_fragments.remove(&key);
+                    analysis.warnings.push(format!(
+                        "Reassembled I/O data exceeds the protocol-sized safety limit ({received} > {MAX_IO_REASSEMBLY_BYTES} bytes); transfer discarded"
+                    ));
+                    return analysis;
+                }
+                state.payload.extend_from_slice(fragment_data);
+                state.last_count = fragment_count;
+                if fragment_type == 1 {
+                    analysis.push("Reassembled bytes", state.payload.len().to_string());
+                    analysis.push("Assembly decode", "Waiting for remaining I/O fragments");
+                    return analysis;
+                }
+                let state = self
+                    .io_fragments
+                    .remove(&key)
+                    .expect("last fragment has an active series");
+                analysis.push(
+                    "First I/O fragment frame",
+                    format!("#{}", state.first_frame),
+                );
+                analysis.push("Reassembled I/O data", hex_bytes(&state.payload));
+                self.append_assembly_payload(direction, instance, &state.payload, analysis)
+            }
+            (0, _) => {
+                self.io_fragments.remove(&key);
+                analysis
+                    .warnings
+                    .push("First I/O fragment count must be 0x00 or 0x3F; reassembly reset".into());
+                analysis
+            }
+            (3, _) => {
+                self.io_fragments.remove(&key);
+                analysis.warnings.push(
+                    "Fragment acknowledgments are not valid for unacknowledged I/O fragmentation"
+                        .into(),
+                );
+                analysis
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    fn append_assembly_payload(
+        &self,
+        direction: IoAssemblyDirection,
+        instance: u8,
+        payload: &[u8],
+        mut analysis: FrameAnalysis,
+    ) -> FrameAnalysis {
+        match decode_assembly(direction, instance, payload) {
+            Ok(decoded) => {
+                analysis.push(
+                    "Numeric conversion",
+                    "CIP INT/REAL values use little-endian encoding. No implicit EDS multiplier, divider, base, or offset is applied; converting Counts requires the device's active Data Units and Full Scale configuration",
+                );
+                for component in decoded.components {
+                    analysis.push_detailed(
+                        component.name,
+                        component.value,
+                        component.unit,
+                        component.description,
+                    );
+                }
+                analysis.warnings.extend(decoded.warnings);
+            }
+            Err(error) => analysis.warnings.push(error),
+        }
+        analysis
     }
 
     fn decode_ucmm(
@@ -981,6 +1395,51 @@ impl ProtocolDecoder {
     }
 }
 
+fn io_payload_direction(
+    function: FrameFunction,
+    identifier: IdentifierFields,
+    message: &TraceMessage,
+    host_mac_id: u8,
+) -> Option<(IoAssemblyDirection, &'static str)> {
+    if message.data.is_empty() {
+        return None;
+    }
+    match (function, identifier) {
+        (
+            FrameFunction::Group1IoMulticastPollResponse
+            | FrameFunction::Group1IoChangeOfStateOrCyclic
+            | FrameFunction::Group1IoBitStrobeResponse
+            | FrameFunction::Group1IoPollResponseOrChangeOfStateAck,
+            IdentifierFields::Group1 { source_mac_id, .. },
+        ) => (source_mac_id != host_mac_id).then_some((
+            IoAssemblyDirection::Input,
+            "User selection assumes the Section 3-7 predefined-set role; the trace identifier does not prove allocation",
+        )),
+        (
+            FrameFunction::Group2(Group2Function::IoMulticastPollCommand),
+            IdentifierFields::Group2 { .. },
+        ) => Some((
+            IoAssemblyDirection::Output,
+            "Predefined Group 2 Multicast Poll Command is controller-produced",
+        )),
+        (
+            FrameFunction::Group2(Group2Function::IoPollOrChangeOfStateOrCyclic),
+            IdentifierFields::Group2 { .. },
+        ) => match message.direction.trim().to_ascii_lowercase().as_str() {
+            "tx" | "transmit" => Some((
+                IoAssemblyDirection::Output,
+                "Capture direction Tx; Group 2 Message ID 5 MAC role is connection-dependent",
+            )),
+            "rx" | "receive" => Some((
+                IoAssemblyDirection::Input,
+                "Capture direction Rx; Group 2 Message ID 5 MAC role is connection-dependent",
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[derive(Default)]
 struct ParsedAddress {
     class_id: Option<u32>,
@@ -1337,7 +1796,7 @@ fn connection_specific(
     analysis.push(
         "Interpretation",
         if predefined_io {
-            "Predefined Controller/Device Connection Set I/O payload"
+            "Section 3-7 Predefined Controller/Device Connection Set role; the identifier alone does not prove that the connection set is allocated"
         } else {
             "Connection-specific I/O or Explicit data; no matching UCMM Open was seen"
         },
@@ -1612,11 +2071,19 @@ mod tests {
         );
         assert_eq!(
             group1_function(0x0c).label(),
-            "Device I/O Multicast Poll Response"
+            "Predefined-set I/O Multicast Poll Response role"
         );
         assert_eq!(
             group1_function(0x0f).label(),
-            "Device I/O Poll Response or Change of State/Cyclic Acknowledge"
+            "Predefined-set I/O Poll Response or Change of State/Cyclic Acknowledge role"
+        );
+        assert!(
+            decoded[0]
+                .as_ref()
+                .unwrap()
+                .field("Interpretation")
+                .unwrap()
+                .contains("does not prove")
         );
         assert_eq!(
             messages[0].decoded_identifier().unwrap().fields,
@@ -1935,6 +2402,425 @@ mod tests {
         assert_eq!(
             analysis.field("Logical path"),
             Some("Class=0x1234 (4660), Instance=0x5678 (22136)")
+        );
+    }
+
+    #[test]
+    fn decodes_selected_io_assemblies_from_the_host_mac_perspective() {
+        let selection = IoAssemblySelection {
+            host_mac_id: 0,
+            input_instance: Some(2),
+            output_instance: Some(7),
+        };
+        let messages = vec![
+            // Group 1 source MAC 1: device-produced Input Assembly.
+            message(1, 0x341, &[0x81, 0x34, 0x12]),
+            // Group 2 multicast poll command: controller-produced Output Assembly.
+            message(2, 0x429, &[0x78, 0x56]),
+            // Group 2 ID 5 addressed to host MAC 0: device-to-host input.
+            message(3, 0x405, &[0x80, 0xfe, 0xff]),
+            // Group 2 ID 5 addressed to device MAC 5: host-to-device output.
+            TraceMessage {
+                direction: "Tx".into(),
+                ..message(4, 0x42d, &[0x02, 0x00])
+            },
+        ];
+        let decoded = decode_trace_ordered_with_io(&messages, selection);
+
+        assert_eq!(
+            decoded[0].as_ref().unwrap().field("I/O direction"),
+            Some("Input - device to host")
+        );
+        assert_eq!(decoded[0].as_ref().unwrap().field("Flow"), Some("4660"));
+        assert_eq!(
+            decoded[1].as_ref().unwrap().field("I/O direction"),
+            Some("Output - host to device")
+        );
+        assert_eq!(
+            decoded[1].as_ref().unwrap().field("Setpoint"),
+            Some("22136")
+        );
+        assert_eq!(decoded[2].as_ref().unwrap().field("Flow"), Some("-2"));
+        assert_eq!(decoded[3].as_ref().unwrap().field("Setpoint"), Some("2"));
+
+        let flow = decoded[0]
+            .as_ref()
+            .unwrap()
+            .fields
+            .iter()
+            .find(|field| field.name == "Flow")
+            .unwrap();
+        assert!(
+            flow.unit
+                .as_deref()
+                .unwrap()
+                .contains("Vol1 default: Counts")
+        );
+        assert!(flow.description.as_deref().unwrap().contains("class 0x31"));
+        assert!(
+            decoded[0]
+                .as_ref()
+                .unwrap()
+                .field("Numeric conversion")
+                .unwrap()
+                .contains("No implicit EDS")
+        );
+    }
+
+    #[test]
+    fn predefined_group1_source_equal_to_host_is_a_topology_conflict() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x340, &[0x78, 0x56])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(2),
+                output_instance: Some(7),
+            },
+        );
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert_eq!(analysis.field("Assembly instance"), None);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("device-produced"))
+        );
+    }
+
+    #[test]
+    fn decodes_selected_direction_when_input_and_output_families_differ() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x341, &[0x80, 0x34, 0x12])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(2),
+                output_instance: Some(19),
+            },
+        );
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert_eq!(analysis.field("Flow"), Some("4660"));
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("mix INT and REAL"))
+        );
+
+        let neutral = decode_trace_ordered_with_io(
+            &[message(2, 0x341, &[0x80])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(9),
+                output_instance: Some(19),
+            },
+        );
+        assert!(neutral[0].as_ref().unwrap().field("Status").is_some());
+    }
+
+    #[test]
+    fn group2_message_id_5_uses_capture_direction_instead_of_the_mac_role() {
+        let selection = IoAssemblySelection {
+            host_mac_id: 0,
+            input_instance: Some(2),
+            output_instance: Some(7),
+        };
+        let messages = [
+            TraceMessage {
+                direction: "Rx".into(),
+                ..message(1, 0x42d, &[0x80, 0x34, 0x12])
+            },
+            TraceMessage {
+                direction: "Tx".into(),
+                ..message(2, 0x42d, &[0x78, 0x56])
+            },
+            TraceMessage {
+                direction: "unknown".into(),
+                ..message(3, 0x42d, &[0x80, 0x34, 0x12])
+            },
+        ];
+        let decoded = decode_trace_ordered_with_io(&messages, selection);
+
+        assert_eq!(decoded[0].as_ref().unwrap().field("Flow"), Some("4660"));
+        assert_eq!(
+            decoded[1].as_ref().unwrap().field("Setpoint"),
+            Some("22136")
+        );
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Assembly instance"),
+            None
+        );
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Tx/Rx capture direction"))
+        );
+    }
+
+    #[test]
+    fn context_free_group1_connection_is_not_assumed_to_be_io() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x201, &[0x80, 0x34, 0x12])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(2),
+                output_instance: Some(7),
+            },
+        );
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert_eq!(analysis.function, FrameFunction::Group1Connection);
+        assert!(!analysis.function.has_io_assembly_payload());
+        assert_eq!(analysis.field("Flow"), None);
+        assert_eq!(analysis.field("Assembly instance"), None);
+    }
+
+    #[test]
+    fn legacy_decode_keeps_io_payload_raw_without_a_selection_context() {
+        let decoded = decode_trace_ordered(&[message(1, 0x341, &[0x80, 1, 0])]);
+        let analysis = decoded[0].as_ref().unwrap();
+        assert_eq!(analysis.field("I/O data"), Some("80 01 00"));
+        assert_eq!(analysis.field("I/O direction"), None);
+        assert_eq!(analysis.field("Assembly instance"), None);
+    }
+
+    #[test]
+    fn reassembles_unacknowledged_io_fragments_before_assembly_decode() {
+        let payload = [0x80, 2, 1, 2, 1, 3, 1, 4, 2, 5, 6, 1, 7, 1, 8];
+        let messages = vec![
+            message(1, 0x341, &[0x00, 0x80, 2, 1, 2, 1, 3, 1]),
+            message(2, 0x341, &[0x41, 4, 2, 5, 6, 1, 7, 1]),
+            message(3, 0x341, &[0x82, 8]),
+        ];
+        let decoded = decode_trace_ordered_with_io(
+            &messages,
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+
+        assert_eq!(
+            decoded[0].as_ref().unwrap().field("Assembly decode"),
+            Some("Waiting for remaining I/O fragments")
+        );
+        assert_eq!(
+            decoded[1].as_ref().unwrap().field("Reassembled bytes"),
+            Some("14")
+        );
+        let final_analysis = decoded[2].as_ref().unwrap();
+        assert_eq!(
+            final_analysis.field("Reassembled I/O data"),
+            Some(hex_bytes(&payload).as_str())
+        );
+        assert!(
+            final_analysis
+                .field("Warning device detail byte 0")
+                .unwrap()
+                .contains("Reading Valid")
+        );
+        assert!(final_analysis.warnings.is_empty());
+    }
+
+    #[test]
+    fn resets_io_reassembly_after_a_missed_fragment() {
+        let decoded = decode_trace_ordered_with_io(
+            &[
+                message(1, 0x341, &[0x00, 1, 2, 3]),
+                message(2, 0x341, &[0x82, 4]),
+                message(3, 0x341, &[0x81, 5]),
+            ],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+        assert!(
+            decoded[1]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Expected I/O fragment count 1"))
+        );
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("before a first fragment"))
+        );
+    }
+
+    #[test]
+    fn decodes_complete_fragmented_application_data_independently_of_connection_size() {
+        let decoded = decode_trace_ordered_with_io(
+            &[
+                message(1, 0x341, &[0x00, 1, 2, 3, 4, 5, 6, 7]),
+                message(2, 0x341, &[0x41, 8, 9, 10, 11, 12, 13, 14]),
+                message(3, 0x341, &[0x82, 15, 16]),
+                message(4, 0x341, &[0x83, 17]),
+            ],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+
+        assert_eq!(
+            decoded[2].as_ref().unwrap().field("Status"),
+            Some(
+                "0x01 (Basic; bits 0-6 are device-specific, 6-29/6-39 fallback Expanded map: common alarm)"
+            )
+        );
+        assert!(
+            decoded[2]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("1 trailing byte(s) were ignored"))
+        );
+        assert!(
+            decoded[3]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("before a first fragment"))
+        );
+    }
+
+    #[test]
+    fn decodes_complete_short_fragment_like_a_short_unfragmented_payload() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x341, &[0x3f, 0x80, 2, 0x01, 0x00, 1, 0x02, 0])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert!(analysis.field("Status").is_some());
+        assert!(analysis.field("Alarm common detail byte 0").is_some());
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("expects 15 bytes"))
+        );
+    }
+
+    #[test]
+    fn rejects_oversized_first_and_single_io_fragments_before_copying_or_formatting() {
+        let mut oversized_first = vec![0; 450];
+        oversized_first[0] = 0x00;
+        let mut oversized_single = vec![0; 450];
+        oversized_single[0] = 0x3f;
+        let decoded = decode_trace_ordered_with_io(
+            &[
+                message(1, 0x341, &oversized_first),
+                message(2, 0x341, &oversized_single),
+            ],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+
+        for analysis in decoded.into_iter().flatten() {
+            assert_eq!(analysis.field("I/O fragment data"), None);
+            assert_eq!(analysis.field("Status"), None);
+            assert!(
+                analysis
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("449 > 448 bytes"))
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_treat_bit_strobe_command_or_dynamic_explicit_data_as_an_assembly() {
+        let selection = IoAssemblySelection {
+            host_mac_id: 0,
+            input_instance: Some(2),
+            output_instance: Some(7),
+        };
+        let messages = vec![
+            message(1, 0x400, &[0xff; 8]),
+            message(2, 0x780, &[5, 0x4b, 2, 0x10]),
+            message(3, 0x745, &[0, 0xcb, 2, 0x45, 2, 0]),
+            message(4, 0x42c, &[0, 0x0e, 1, 1, 1]),
+        ];
+        let decoded = decode_trace_ordered_with_io(&messages, selection);
+
+        assert_eq!(
+            decoded[0].as_ref().unwrap().field("Assembly instance"),
+            None
+        );
+        assert_eq!(decoded[0].as_ref().unwrap().field("Assembly mapping"), None);
+        assert_eq!(
+            decoded[3].as_ref().unwrap().function,
+            FrameFunction::ConnectedExplicitRequest
+        );
+        assert_eq!(
+            decoded[3].as_ref().unwrap().field("Assembly instance"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_a_fragmented_size_assembly_for_bit_strobe_response() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x381, &[0; 8])],
+            IoAssemblySelection {
+                host_mac_id: 0,
+                input_instance: Some(12),
+                output_instance: None,
+            },
+        );
+        let analysis = decoded[0].as_ref().unwrap();
+
+        assert_eq!(analysis.function, FrameFunction::Group1IoBitStrobeResponse);
+        assert_eq!(analysis.field("Status"), None);
+        assert_eq!(analysis.field("I/O fragment type"), None);
+        assert!(
+            analysis
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Bit-Strobe Response data cannot carry"))
+        );
+    }
+
+    #[test]
+    fn rejects_an_invalid_host_mac_for_assembly_direction_inference() {
+        let decoded = decode_trace_ordered_with_io(
+            &[message(1, 0x341, &[0, 1, 0])],
+            IoAssemblySelection {
+                host_mac_id: 64,
+                input_instance: Some(2),
+                output_instance: Some(7),
+            },
+        );
+        assert!(
+            decoded[0]
+                .as_ref()
+                .unwrap()
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("outside the DeviceNet range"))
         );
     }
 }

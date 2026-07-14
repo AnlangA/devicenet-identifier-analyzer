@@ -2,8 +2,8 @@ use crate::ai_import::{AiEndpoint, AiImportOutput, AiImportRequest, request_can_
 use crate::frame_input::{FrameOrigin, NewCanFrame, format_saved_frame};
 use crate::theme;
 use devicenet_identifier_analyzer::{
-    FrameAnalysis, MessageGroup, TraceMessage, compare_optional_time, decode_trace_ordered,
-    parse_trace_log,
+    FrameAnalysis, IoAssemblySelection, MessageGroup, TraceMessage, compare_optional_time,
+    decode_trace_ordered_with_io, parse_trace_log,
 };
 use eframe::egui;
 use std::path::PathBuf;
@@ -100,6 +100,7 @@ pub(crate) struct TraceStats {
     pub(crate) group2: usize,
     pub(crate) group3: usize,
     pub(crate) group4: usize,
+    pub(crate) io_assembly_candidates: usize,
     pub(crate) warnings: usize,
     pub(crate) user_created: usize,
     pub(crate) duration_ms: f64,
@@ -126,6 +127,16 @@ impl TraceStats {
         let group2 = count_group(MessageGroup::Group2);
         let group3 = count_group(MessageGroup::Group3);
         let group4 = count_group(MessageGroup::Group4);
+        let io_assembly_candidates = frames
+            .iter()
+            .filter(|frame| {
+                !frame.message.data.is_empty()
+                    && frame
+                        .analysis
+                        .as_ref()
+                        .is_some_and(|analysis| analysis.function.has_io_assembly_payload())
+            })
+            .count();
         let warnings = frames
             .iter()
             .filter_map(|frame| frame.analysis.as_ref())
@@ -152,6 +163,7 @@ impl TraceStats {
             group2,
             group3,
             group4,
+            io_assembly_candidates,
             warnings,
             user_created,
             duration_ms,
@@ -206,8 +218,9 @@ impl TraceDocument {
         path: PathBuf,
         messages: Vec<TraceMessage>,
         origins: Vec<FrameOrigin>,
+        io_assembly: IoAssemblySelection,
     ) -> Self {
-        let frames = analyze_frames(messages, origins);
+        let frames = analyze_frames(messages, origins, io_assembly);
         let stats = TraceStats::from_frames(&frames);
         Self {
             path,
@@ -217,12 +230,12 @@ impl TraceDocument {
         }
     }
 
-    fn reanalyze(&mut self) {
+    fn reanalyze(&mut self, io_assembly: IoAssemblySelection) {
         let (messages, origins) = std::mem::take(&mut self.frames)
             .into_iter()
             .map(|frame| (frame.message, frame.origin))
             .unzip();
-        self.frames = analyze_frames(messages, origins);
+        self.frames = analyze_frames(messages, origins, io_assembly);
         self.stats = TraceStats::from_frames(&self.frames);
     }
 
@@ -242,6 +255,7 @@ pub(crate) struct AnalyzerApp {
     pub(crate) scroll_to_position: Option<usize>,
     pub(crate) filters: MessageFilters,
     pub(crate) sort_order: SortOrder,
+    pub(crate) io_assembly: IoAssemblySelection,
     pub(crate) load_error: Option<String>,
     pub(crate) operation_message: Option<Result<String, String>>,
     pub(crate) show_input_window: bool,
@@ -263,6 +277,7 @@ impl AnalyzerApp {
             scroll_to_position: None,
             filters: MessageFilters::default(),
             sort_order: SortOrder::Ascending,
+            io_assembly: IoAssemblySelection::default(),
             load_error: None,
             operation_message: None,
             show_input_window: false,
@@ -294,8 +309,11 @@ impl AnalyzerApp {
                 }
 
                 let origins = vec![FrameOrigin::File; trace.messages.len()];
-                let mut document = TraceDocument::from_messages(path, trace.messages, origins);
+                let io_assembly = IoAssemblySelection::default();
+                let mut document =
+                    TraceDocument::from_messages(path, trace.messages, origins, io_assembly);
                 document.skipped_message_lines = trace.skipped_message_lines;
+                self.io_assembly = io_assembly;
                 self.document = Some(document);
                 self.filters = MessageFilters::default();
                 self.sort_order = SortOrder::Ascending;
@@ -403,6 +421,17 @@ impl AnalyzerApp {
 
     pub(crate) fn selected_source_index(&self) -> Option<usize> {
         self.selected_index
+    }
+
+    pub(crate) fn set_io_assembly_selection(&mut self, selection: IoAssemblySelection) {
+        if self.io_assembly == selection {
+            return;
+        }
+        self.io_assembly = selection;
+        if let Some(document) = &mut self.document {
+            document.reanalyze(self.io_assembly);
+        }
+        self.refresh_visible_indices();
     }
 
     pub(crate) fn add_manual_frame(&mut self) {
@@ -569,20 +598,24 @@ impl AnalyzerApp {
             });
             next_number = next_number.saturating_add(1);
         }
-        document.reanalyze();
+        document.reanalyze(self.io_assembly);
         self.selected_index = Some(first_inserted);
         self.refresh_visible_indices();
         self.visible_indices.contains(&first_inserted)
     }
 }
 
-fn analyze_frames(messages: Vec<TraceMessage>, origins: Vec<FrameOrigin>) -> Vec<AnalyzedFrame> {
+fn analyze_frames(
+    messages: Vec<TraceMessage>,
+    origins: Vec<FrameOrigin>,
+    io_assembly: IoAssemblySelection,
+) -> Vec<AnalyzedFrame> {
     assert_eq!(
         messages.len(),
         origins.len(),
         "every trace message must have exactly one origin"
     );
-    let analyses = decode_trace_ordered(&messages);
+    let analyses = decode_trace_ordered_with_io(&messages, io_assembly);
     messages
         .into_iter()
         .zip(analyses)
@@ -639,6 +672,14 @@ fn build_search_text(message: &TraceMessage, analysis: Option<&FrameAnalysis>) -
             text.push_str(&field.name.to_ascii_uppercase());
             text.push('\n');
             text.push_str(&field.value.to_ascii_uppercase());
+            if let Some(unit) = &field.unit {
+                text.push('\n');
+                text.push_str(&unit.to_ascii_uppercase());
+            }
+            if let Some(description) = &field.description {
+                text.push('\n');
+                text.push_str(&description.to_ascii_uppercase());
+            }
         }
     }
     text
@@ -664,7 +705,10 @@ mod tests {
     fn filters_direction_scope_and_decoded_text() {
         let explicit = message(1, 0x40e, "Tx", &[0, 0x4b, 3, 1, 1, 0]);
         let io = message(2, 0x40d, "Rx", &[0xaa]);
-        let decoded = decode_trace_ordered(&[explicit.clone(), io.clone()]);
+        let decoded = decode_trace_ordered_with_io(
+            &[explicit.clone(), io.clone()],
+            IoAssemblySelection::default(),
+        );
         assert!(direction_matches(&explicit, DirectionFilter::Tx));
         assert!(!direction_matches(&explicit, DirectionFilter::Rx));
         assert!(scope_matches(
@@ -689,7 +733,11 @@ mod tests {
             message.time_offset_ms = Some(8.0);
             message
         }];
-        let frames = analyze_frames(messages, vec![FrameOrigin::File; 2]);
+        let frames = analyze_frames(
+            messages,
+            vec![FrameOrigin::File; 2],
+            IoAssemblySelection::default(),
+        );
         let stats = TraceStats::from_frames(&frames);
         let mut app = AnalyzerApp {
             document: Some(TraceDocument {
@@ -704,6 +752,7 @@ mod tests {
             scroll_to_position: None,
             filters: MessageFilters::default(),
             sort_order: SortOrder::Ascending,
+            io_assembly: IoAssemblySelection::default(),
             load_error: None,
             operation_message: None,
             show_input_window: false,
@@ -741,10 +790,98 @@ mod tests {
         let frames = analyze_frames(
             vec![late, early, missing],
             vec![FrameOrigin::File, FrameOrigin::Manual, FrameOrigin::Ai],
+            IoAssemblySelection::default(),
         );
         let stats = TraceStats::from_frames(&frames);
 
         assert_eq!(stats.duration_ms, 8.0);
         assert_eq!(stats.user_created, 2);
+    }
+
+    #[test]
+    fn changing_io_instance_reanalyzes_fields_and_search_text_in_place() {
+        let document = TraceDocument::from_messages(
+            "io.log".into(),
+            vec![message(1, 0x341, "Tx", &[0x80, 0x34, 0x12])],
+            vec![FrameOrigin::File],
+            IoAssemblySelection::default(),
+        );
+        let mut app = AnalyzerApp {
+            document: Some(document),
+            selected_index: Some(0),
+            visible_indices: vec![0],
+            rendered_row_range: 0..1,
+            scroll_to_position: None,
+            filters: MessageFilters::default(),
+            sort_order: SortOrder::Ascending,
+            io_assembly: IoAssemblySelection::default(),
+            load_error: None,
+            operation_message: None,
+            show_input_window: false,
+            input_needs_focus: false,
+            input_tab: InputTab::Manual,
+            manual_input: ManualInputForm::default(),
+            ai_input: AiInputForm::default(),
+            ai_job: None,
+        };
+
+        assert_eq!(app.io_assembly.host_mac_id, 0);
+        assert_eq!(
+            app.document.as_ref().unwrap().stats.io_assembly_candidates,
+            1
+        );
+        assert_eq!(
+            app.document.as_ref().unwrap().frames[0]
+                .analysis
+                .as_ref()
+                .unwrap()
+                .field("Flow"),
+            None
+        );
+
+        app.set_io_assembly_selection(IoAssemblySelection {
+            host_mac_id: 0,
+            input_instance: Some(2),
+            output_instance: None,
+        });
+
+        let frame = &app.document.as_ref().unwrap().frames[0];
+        assert_eq!(frame.analysis.as_ref().unwrap().field("Flow"), Some("4660"));
+        assert!(frame.search_text.contains("DEVICE-CONFIGURED DATA UNITS"));
+        assert!(frame.search_text.contains("FULL SCALE"));
+        assert!(frame.search_text.contains("S-ANALOG SENSOR OBJECT"));
+        assert_eq!(app.selected_index, Some(0));
+        assert_eq!(frame.origin, FrameOrigin::File);
+
+        app.set_io_assembly_selection(IoAssemblySelection::default());
+        assert_eq!(
+            app.document.as_ref().unwrap().frames[0]
+                .analysis
+                .as_ref()
+                .unwrap()
+                .field("Flow"),
+            None
+        );
+    }
+
+    #[test]
+    fn only_application_io_payloads_enable_assembly_selection() {
+        let frames = analyze_frames(
+            vec![
+                message(1, 0x400, "Tx", &[0xff; 8]),
+                message(2, 0x410, "Rx", &[]),
+                message(3, 0x201, "Rx", &[1, 2, 3]),
+            ],
+            vec![FrameOrigin::File; 3],
+            IoAssemblySelection::default(),
+        );
+        assert_eq!(TraceStats::from_frames(&frames).io_assembly_candidates, 0);
+
+        let frames = analyze_frames(
+            vec![message(4, 0x341, "Rx", &[0x80, 1, 0])],
+            vec![FrameOrigin::File],
+            IoAssemblySelection::default(),
+        );
+        assert_eq!(TraceStats::from_frames(&frames).io_assembly_candidates, 1);
     }
 }

@@ -5,8 +5,9 @@ use crate::theme::{
     ACCENT, AMBER, BG, BLUE, BORDER, MUTED, PANEL, PANEL_SOFT, PURPLE, RED, SURFACE, TEXT,
 };
 use devicenet_identifier_analyzer::{
-    DecodedIdentifier, FrameAnalysis, FrameFunction, Group2Function, IdentifierFields,
-    MessageGroup, TraceMessage, service_description,
+    DecodedIdentifier, FrameAnalysis, FrameFunction, Group2Function, INPUT_ASSEMBLIES,
+    IdentifierFields, IoAssemblyInstance, IoAssemblySelection, MessageGroup, OUTPUT_ASSEMBLIES,
+    TraceMessage, service_description,
 };
 use eframe::egui::{
     self, Align2, Color32, FontFamily, FontId, Pos2, RichText, Sense, Stroke, Vec2,
@@ -588,6 +589,18 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
         }
     }
 
+    if app
+        .document
+        .as_ref()
+        .is_some_and(|document| document.stats.io_assembly_candidates > 0)
+    {
+        ui.add_space(10.0);
+        let mut selection = app.io_assembly;
+        if io_assembly_controls(ui, &mut selection) {
+            app.set_io_assembly_selection(selection);
+        }
+    }
+
     ui.add_space(10.0);
     if filter_bar(ui, &mut app.filters) {
         app.refresh_visible_indices();
@@ -666,6 +679,123 @@ fn message_list_panel(ui: &mut egui::Ui, app: &mut AnalyzerApp) {
     if let Some(index) = clicked_index {
         app.selected_index = Some(index);
     }
+}
+
+fn io_assembly_controls(ui: &mut egui::Ui, selection: &mut IoAssemblySelection) -> bool {
+    let mut changed = false;
+    egui::Frame::new()
+        .fill(SURFACE)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(7.0)
+        .inner_margin(10.0)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.label(
+                    RichText::new("DEVICE I/O ASSEMBLY")
+                        .size(10.5)
+                        .color(MUTED)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "Vol1 6-29 / 6-39 + GT EDS/device-dictionary mappings · Host MAC {} · Output host → device · Input device → host",
+                        selection.host_mac_id
+                    ))
+                    .size(11.0)
+                    .color(MUTED),
+                );
+            });
+            ui.label(
+                RichText::new(
+                    "No implicit EDS scaling · Counts conversion requires device Data Units and Full Scale",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+            ui.label(
+                RichText::new(
+                    "Connection order selects the INT/REAL family · Mixed selections are decoded independently with a warning",
+                )
+                .size(10.5)
+                .color(MUTED),
+            );
+            ui.add_space(7.0);
+            egui::Grid::new("io_assembly_selectors")
+                .num_columns(2)
+                .min_col_width(112.0)
+                .spacing([12.0, 7.0])
+                .show(ui, |ui| {
+                    ui.label(RichText::new("Input instance").size(11.5).color(TEXT));
+                    changed |= assembly_combo(
+                        ui,
+                        "input_assembly_instance",
+                        &mut selection.input_instance,
+                        INPUT_ASSEMBLIES,
+                        "Select input instance…",
+                    );
+                    ui.end_row();
+
+                    ui.label(RichText::new("Output instance").size(11.5).color(TEXT));
+                    changed |= assembly_combo(
+                        ui,
+                        "output_assembly_instance",
+                        &mut selection.output_instance,
+                        OUTPUT_ASSEMBLIES,
+                        "Select output instance…",
+                    );
+                    ui.end_row();
+                });
+        });
+    changed
+}
+
+fn assembly_combo(
+    ui: &mut egui::Ui,
+    id: &'static str,
+    selected: &mut Option<u8>,
+    instances: &'static [IoAssemblyInstance],
+    placeholder: &'static str,
+) -> bool {
+    let selected_text = selected
+        .and_then(|number| instances.iter().find(|instance| instance.number == number))
+        .map_or_else(
+            || placeholder.to_owned(),
+            |instance| {
+                format!(
+                    "{} (0x{:02X}) — {} · {}",
+                    instance.number,
+                    instance.number,
+                    instance.name,
+                    instance.numeric_format().label()
+                )
+            },
+        );
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(selected_text)
+        .width(ui.available_width().max(260.0))
+        .show_ui(ui, |ui| {
+            changed |= ui
+                .selectable_value(selected, None, "Not selected — keep raw I/O data")
+                .changed();
+            for instance in instances {
+                let label = format!(
+                    "{} (0x{:02X}) — {} · {} B · {} · {}",
+                    instance.number,
+                    instance.number,
+                    instance.name,
+                    instance.byte_len,
+                    instance.profile,
+                    instance.numeric_format().label()
+                );
+                let response = ui
+                    .selectable_value(selected, Some(instance.number), label)
+                    .on_hover_text(instance.requirements);
+                changed |= response.changed();
+            }
+        });
+    changed
 }
 
 fn filter_bar(ui: &mut egui::Ui, filters: &mut MessageFilters) -> bool {
@@ -1113,15 +1243,41 @@ fn data_decoder_panel(
                         } else {
                             field.value.clone()
                         };
-                        let value_response = ui.add(
-                            egui::Label::new(
-                                RichText::new(display_value)
-                                    .size(12.0)
-                                    .color(TEXT)
-                                    .monospace(),
-                            )
-                            .wrap(),
-                        );
+                        let value_response = ui
+                            .vertical(|ui| {
+                                let response = ui
+                                    .horizontal_wrapped(|ui| {
+                                        let response = ui.add(
+                                            egui::Label::new(
+                                                RichText::new(display_value)
+                                                    .size(12.0)
+                                                    .color(TEXT)
+                                                    .monospace(),
+                                            )
+                                            .wrap(),
+                                        );
+                                        if let Some(unit) = &field.unit {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(unit).size(11.0).color(MUTED),
+                                                )
+                                                .wrap(),
+                                            );
+                                        }
+                                        response
+                                    })
+                                    .inner;
+                                if let Some(description) = &field.description {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(description).size(11.0).color(MUTED),
+                                        )
+                                        .wrap(),
+                                    );
+                                }
+                                response
+                            })
+                            .inner;
                         if let Some(code) = service_code {
                             add_service_tooltip(name_response, code, &field.value);
                             add_service_tooltip(value_response, code, &field.value);
